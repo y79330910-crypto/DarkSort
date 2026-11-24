@@ -1,0 +1,392 @@
+from __future__ import annotations
+
+from collections import Counter
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+)
+
+from darksort.history import ProfileHistory, compare_entries
+from darksort.models import OrderRule, Profile
+from darksort.profiles import resolve_entries
+from darksort.rule_targets import dynamic_target
+from darksort.sorting import OrderPreview
+from darksort.ui.mod_list import ROLE
+from darksort.ui.theme import current_theme
+from darksort.ui.workspace_dock import data_table, decision_rows, fill_table
+from darksort.workshop import workshop_page
+
+
+def text_view(text: str = "") -> QPlainTextEdit:
+    view = QPlainTextEdit(text)
+    view.setReadOnly(True)
+    return view
+
+
+def confirmation_dialog(parent, title: str, text: str, action: str = "") -> bool:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(720, 470)
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(text_view(text))
+    buttons = QDialogButtonBox()
+    if action:
+        accept = buttons.addButton(action, QDialogButtonBox.ButtonRole.AcceptRole)
+        accept.setObjectName("primary")
+    cancel = buttons.addButton("取消" if action else "关闭", QDialogButtonBox.ButtonRole.RejectRole)
+    cancel.setDefault(True)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    dialog.deleteLater()
+    return accepted
+
+
+def transfer_matches(mods, sections, scanned: bool, *, show_all=False) -> str:
+    summaries, lists = [], []
+    for title, entries in sections:
+        if not entries:
+            continue
+        rows = resolve_entries(entries, mods)
+        missing = sum(row.mod is None for row in rows)
+        summaries.append(f"{title} · {len(rows)} 项 · {len(rows) - missing} 已匹配 · {missing} 待匹配")
+        lines = []
+        for index, row in enumerate(rows, 1):
+            if row.mod and not show_all:
+                continue
+            reason = "已匹配" if row.mod else row.problem if scanned else "扫描后匹配"
+            lines.append(f"#{index:02d}  {row.entry.name}  ·  {reason}")
+            if not row.mod and (link := workshop_page(row.entry.workshop_id)):
+                lines.append(f"        {link}")
+        if lines:
+            heading = title if show_all else f"{title} · 待匹配项"
+            lists.append("\n".join([heading, *lines]))
+    if not summaries:
+        return "共 0 项 Mod。"
+    if not scanned:
+        summaries.append("当前尚未扫描 Mod。载入后可扫描并重新匹配。")
+    return "\n\n".join(["\n".join(summaries), *lists])
+
+
+class SortPreviewDialog(QDialog):
+    def __init__(self, preview: OrderPreview, *, rules_only=False, title=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title or ("规则排序预览" if rules_only else "智能排序预览"))
+        self.resize(980, 530)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        header = QHBoxLayout()
+        count = sum(row.before != row.after for row in preview.decisions)
+        heading = QLabel(f"{count} 个条目建议移动" if not preview.blockers else "排序规则需要处理")
+        heading.setObjectName("section")
+        header.addWidget(heading, 1)
+        moved = QCheckBox("只看变动")
+        moved.setEnabled(bool(count))
+        header.addWidget(moved)
+        layout.addLayout(header)
+        table = data_table(("原位 → 新位", "MOD", "分类", "排序依据"), (96, 270, 106, 0))
+        fill_table(table, decision_rows(preview))
+        table.setVisible(not preview.blockers)
+        layout.addWidget(table, 1)
+        moved.toggled.connect(
+            lambda checked: fill_table(table, decision_rows(preview, changed_only=checked))
+        )
+        messages = (*preview.blockers, *preview.notices)
+        if messages:
+            notices = text_view("\n".join(messages))
+            if not preview.blockers:
+                notices.setMaximumHeight(94)
+            layout.addWidget(notices)
+        buttons = QDialogButtonBox()
+        if count and not preview.blockers:
+            accept = buttons.addButton("采用建议顺序", QDialogButtonBox.ButtonRole.AcceptRole)
+            accept.setObjectName("primary")
+        cancel = buttons.addButton("取消" if count else "关闭", QDialogButtonBox.ButtonRole.RejectRole)
+        cancel.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class HistoryDialog(QDialog):
+    def __init__(self, history: ProfileHistory, profile: Profile, parent=None, *, snapshot_id=None):
+        super().__init__(parent)
+        self.history = history
+        self.profile = profile
+        self.restored = None
+        self.setWindowTitle(f"方案历史 · {profile.name}")
+        self.resize(1070, 570)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(9)
+        heading = QLabel("快照对比")
+        heading.setObjectName("section")
+        layout.addWidget(heading)
+        splitter = QSplitter()
+        self.snapshots = QListWidget(objectName="snapshotList")
+        self.snapshots.setAccessibleName("选择历史快照")
+        self.snapshots.setMinimumWidth(175)
+        self.snapshots.currentItemChanged.connect(self.show_snapshot)
+        splitter.addWidget(self.snapshots)
+
+        detail = QFrame(objectName="panel")
+        compare = QVBoxLayout(detail)
+        compare.setContentsMargins(10, 8, 10, 8)
+        compare.setSpacing(8)
+        controls = QHBoxLayout()
+        self.diff_summary = QLabel()
+        self.diff_summary.setObjectName("muted")
+        controls.addWidget(self.diff_summary, 1)
+        self.hide_unchanged = QCheckBox("收起一致和顺延")
+        self.hide_unchanged.setChecked(True)
+        self.hide_unchanged.toggled.connect(self.render_diff)
+        controls.addWidget(self.hide_unchanged)
+        compare.addLayout(controls)
+        self.diff = data_table(("序号", "当前方案", "变化", "序号", "所选快照"), (47, 0, 87, 47, 0))
+        self.diff.setAccessibleName("当前方案与所选快照差异")
+        self.diff.verticalHeader().setDefaultSectionSize(28)
+        compare.addWidget(self.diff, 1)
+        self.diff_notes = QLabel()
+        self.diff_notes.setObjectName("muted")
+        self.diff_notes.setWordWrap(True)
+        compare.addWidget(self.diff_notes)
+        splitter.addWidget(detail)
+        splitter.setSizes([235, 780])
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+        self.errors = QLabel()
+        self.errors.setObjectName("badge")
+        layout.addWidget(self.errors)
+        buttons = QDialogButtonBox()
+        create = buttons.addButton("创建命名快照", QDialogButtonBox.ButtonRole.ActionRole)
+        create.clicked.connect(self.capture)
+        self.restore_button = buttons.addButton("载入为方案草稿", QDialogButtonBox.ButtonRole.ActionRole)
+        self.restore_button.setObjectName("primary")
+        self.restore_button.clicked.connect(self.restore)
+        buttons.addButton("关闭", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.changes = []
+        self.reload(snapshot_id)
+
+    def reload(self, snapshot_id=None):
+        self.snapshots.clear()
+        snapshots, errors = self.history.list(self.profile.id)
+        selected = 0
+        for snapshot in snapshots:
+            local_time = snapshot.taken.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            name = snapshot.name or snapshot.reason
+            item = QListWidgetItem(f"{name}\n{local_time} · {len(snapshot.profile.entries)} 个 Mod")
+            item.setData(ROLE, snapshot)
+            self.snapshots.addItem(item)
+            if snapshot.id == snapshot_id:
+                selected = self.snapshots.count() - 1
+        self.restore_button.setEnabled(False)
+        if snapshots:
+            self.snapshots.setCurrentRow(selected)
+        else:
+            self.show_snapshot(None, None)
+        self.errors.setText(f"{len(errors)} 个快照无法读取")
+        self.errors.setToolTip("\n".join(errors))
+        self.errors.setVisible(bool(errors))
+
+    def show_snapshot(self, current, _previous):
+        self.restore_button.setEnabled(current is not None)
+        self.hide_unchanged.setEnabled(current is not None)
+        if current is None:
+            self.changes = []
+            self.diff_summary.setText("该方案还没有快照。")
+            self.diff_notes.clear()
+            self.render_diff()
+            return
+        snapshot = current.data(ROLE)
+        self.changes = compare_entries(self.profile, snapshot.profile)
+        counts = Counter(row.status for row in self.changes)
+        self.diff_summary.setText("   ·   ".join((
+            f"加入 {counts['加入']}", f"移除 {counts['移除']}",
+            f"移位 {counts['移位'] + counts['移位 + 更新']}", f"顺延 {counts['顺延']}",
+            f"更新 {counts['更新'] + counts['移位 + 更新']}",
+        )))
+        notes = []
+        if self.profile.groups != snapshot.profile.groups:
+            notes.append("分组有变化")
+        if self.profile.rules != snapshot.profile.rules:
+            notes.append("排序规则有变化")
+        if self.profile.staged != snapshot.profile.staged:
+            notes.append(f"暂存篮 {len(self.profile.staged)} → {len(snapshot.profile.staged)} 项有变化")
+        if self.profile.locks != snapshot.profile.locks:
+            notes.append(f"联锁 {len(self.profile.locks)} → {len(snapshot.profile.locks)} 组有变化")
+        notes.append("按相同 Mod 对齐。顺延条目的相对顺序一致。")
+        self.diff_notes.setText(" · ".join(notes))
+        self.render_diff()
+
+    def render_diff(self, _checked=False):
+        changes = [
+            row for row in self.changes
+            if not self.hide_unchanged.isChecked() or row.status not in {"一致", "顺延"}
+        ]
+        colors = {
+            "加入": "#79ccaa", "移除": "#eda29b", "移位": "#edbc84",
+            "移位 + 更新": "#edbc84", "更新": "#b7ade9",
+        }
+        theme = current_theme()
+        fill_table(self.diff, (
+            (row.before or "—", row.old_entry.name if row.old_entry else "—", row.status,
+             row.after or "—", row.new_entry.name if row.new_entry else "—")
+            for row in changes
+        ))
+        for index, row in enumerate(changes):
+            marker = self.diff.item(index, 2)
+            marker.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if color := colors.get(row.status):
+                hue = QColor(color) if theme.dark else QColor(color).darker(166)
+                marker.setForeground(hue)
+                marker.setBackground(theme.tint(hue.name(), 0.15))
+
+    def capture(self):
+        name, ok = QInputDialog.getText(self, "创建快照", "快照名称")
+        if not ok or not name.strip():
+            return
+        try:
+            snapshot = self.history.capture(self.profile, "手动创建", name=name[:120])
+            self.reload(snapshot.id)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "快照未创建", str(exc))
+
+    def restore(self):
+        item = self.snapshots.currentItem()
+        if item is None:
+            return
+        self.restored = item.data(ROLE).profile
+        self.accept()
+
+
+class RuleDialog(QDialog):
+    def __init__(self, rules: list[OrderRule], names: dict[str, str], parent=None):
+        super().__init__(parent)
+        self.names = names
+        self.setWindowTitle("方案排序规则")
+        self.resize(750, 510)
+        layout = QVBoxLayout(self)
+        subtitle = QLabel("「在上方」可以选择 Mod、分组、标签或标记颜色。「依赖」可以选择两个具体 Mod。")
+        subtitle.setObjectName("muted")
+        layout.addWidget(subtitle)
+        self.list = QListWidget()
+        layout.addWidget(self.list)
+        for rule in rules:
+            self.add_row(rule)
+        form = QFormLayout()
+        self.first = self.mod_combo()
+        self.second = self.mod_combo()
+        self.relation = QComboBox()
+        self.relation.addItem("在上方", "above")
+        self.relation.addItem("依赖", "requires")
+        self.note = QLineEdit()
+        self.note.setPlaceholderText("可选，例如补丁放在本体上方")
+        self.note.setMaxLength(500)
+        form.addRow("目标 A", self.first)
+        form.addRow("关系", self.relation)
+        form.addRow("目标 B", self.second)
+        form.addRow("说明", self.note)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        add = QPushButton("添加规则")
+        add.clicked.connect(self.add_rule)
+        actions.addWidget(add)
+        remove = QPushButton("移除所选")
+        remove.clicked.connect(self.remove_rule)
+        actions.addWidget(remove)
+        actions.addStretch()
+        layout.addLayout(actions)
+        buttons = QDialogButtonBox()
+        buttons.addButton("保留规则", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def mod_combo(self):
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setPlaceholderText("搜索 Mod、分组、标签或颜色")
+        for key, name in sorted(self.names.items(), key=lambda pair: pair[1].casefold()):
+            combo.addItem(name, key)
+        combo.setCurrentIndex(-1)
+        combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        return combo
+
+    def add_row(self, rule: OrderRule):
+        first = self.names.get(rule.first, "已移除的分组" if rule.first.startswith("group:") else rule.first)
+        second = self.names.get(rule.second, "已移除的分组" if rule.second.startswith("group:") else rule.second)
+        relation = "在上方" if rule.kind == "above" else "依赖"
+        item = QListWidgetItem(f"{first}  ›  {relation}  ›  {second}")
+        item.setData(ROLE, rule)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if rule.enabled else Qt.CheckState.Unchecked)
+        item.setToolTip(rule.note)
+        if rule.note:
+            item.setText(f"{item.text()}  ·  {rule.note}")
+        self.list.addItem(item)
+
+    def add_rule(self):
+        endpoints = []
+        for combo in (self.first, self.second):
+            index = combo.currentIndex()
+            if index < 0 or combo.currentText() != combo.itemText(index):
+                QMessageBox.information(self, "请选择目标", "从候选列表选中两个不同的目标。")
+                return
+            endpoints.append(combo.itemData(index))
+        first, second = endpoints
+        if first == second:
+            QMessageBox.information(self, "请选择目标", "请为规则选择两个不同的目标。")
+            return
+        kind = self.relation.currentData()
+        if kind == "requires" and (dynamic_target(first) or dynamic_target(second)):
+            QMessageBox.information(self, "请选择具体 Mod", "分组、标签和颜色用于「在上方」规则。")
+            return
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            rule = item.data(ROLE)
+            if (rule.first, rule.second, rule.kind) == (first, second, kind):
+                self.list.setCurrentItem(item)
+                return
+        self.add_row(OrderRule(first, second, kind, self.note.text().strip()))
+        self.note.clear()
+
+    def remove_rule(self):
+        for item in self.list.selectedItems():
+            self.list.takeItem(self.list.row(item))
+
+    def result_rules(self) -> list[OrderRule]:
+        rules = []
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            rule = item.data(ROLE)
+            rules.append(
+                OrderRule(
+                    rule.first, rule.second, rule.kind, rule.note,
+                    item.checkState() == Qt.CheckState.Checked,
+                )
+            )
+        return rules
