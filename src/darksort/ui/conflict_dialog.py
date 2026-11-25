@@ -53,6 +53,7 @@ class ConflictPanel(QFrame):
     jump = Signal(str)
     change_ignored = Signal(object, bool)
     ask_ai = Signal(object)
+    add_order_rule = Signal(str, str)
 
     def __init__(self, recheck, parent=None):
         super().__init__(parent)
@@ -139,6 +140,8 @@ class ConflictPanel(QFrame):
         self.targets.itemClicked.connect(lambda item: self.jump.emit(item.data(ROLE)))
         self.targets.itemActivated.connect(lambda item: self.jump.emit(item.data(ROLE)))
         self.advice = plain_label("", "muted")
+        self.rule = QPushButton("添加排序规则…", objectName="quiet")
+        self.rule.clicked.connect(self.create_order_rule)
         self.files = QPushButton("▸ 文件与判定依据")
         self.files.setObjectName("quiet")
         self.files.setCheckable(True)
@@ -150,6 +153,7 @@ class ConflictPanel(QFrame):
         detail.addWidget(self.message)
         detail.addWidget(self.targets)
         detail.addWidget(self.advice)
+        detail.addWidget(self.rule, 0, Qt.AlignmentFlag.AlignLeft)
         detail.addWidget(self.files, 0, Qt.AlignmentFlag.AlignLeft)
         detail.addWidget(self.technical)
         detail.addStretch()
@@ -259,6 +263,7 @@ class ConflictPanel(QFrame):
         self.targets.setFixedHeight(2 + sum(self.targets.sizeHintForRow(i) for i in range(visible_rows)))
         self.advice.setText(problem.advice if problem else "")
         self.advice.setVisible(bool(problem))
+        self.rule.setVisible(bool(problem and problem.order_pair))
         self.files.setChecked(False)
         self.files.setVisible(bool(problem and problem.details))
         self.technical.setPlainText(problem.details if problem else "")
@@ -296,6 +301,10 @@ class ConflictPanel(QFrame):
     def ask_current(self):
         if self.current_problem:
             self.ask_ai.emit(self.current_problem)
+
+    def create_order_rule(self):
+        if self.current_problem and self.current_problem.order_pair:
+            self.add_order_rule.emit(*self.current_problem.order_pair)
 
     def show_report(self):
         if self.report is not None:

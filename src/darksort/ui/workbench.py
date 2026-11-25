@@ -489,6 +489,7 @@ class UtilityPane(QFrame):
         self.conflict_panel.jump.connect(window.jump_to_problem_mod)
         self.conflict_panel.change_ignored.connect(window.change_ignored_problems)
         self.conflict_panel.ask_ai.connect(window.ask_about_problem)
+        self.conflict_panel.add_order_rule.connect(window.edit_conflict_rule)
         self.tabs.addTab(self.conflict_panel, "冲突")
         self.subject = label("", "section")
         self.subject.setWordWrap(True)

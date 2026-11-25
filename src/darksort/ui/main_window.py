@@ -1422,11 +1422,16 @@ class MainWindow(QMainWindow):
 
     def add_plan_menu_actions(self, menu, data, indices):
         menu.addAction("添加或编辑分组标题…", lambda: self.edit_group_at(indices[0]))
+        reference = self.profile.entries[data["value"]].reference
+        menu.addAction("添加排序规则…", lambda: self.edit_rules(first=reference))
         menu.addSeparator()
         locking = menu.addAction(icon("link"), "联锁选中项", lambda: self.lock_selected(quick=True))
         members = {self.profile.entries[i].id for i in indices}
         locked = bool(members.intersection(self.lock_by_entry))
-        locking.setEnabled(len(indices) >= 2 and not locked and not self.profile_list.reorder_blocked)
+        locking.setEnabled(
+            len(indices) >= 2 and not locked
+            and (self.plan_is_filtered() or not self.profile_list.reorder_blocked)
+        )
         unlocking = menu.addAction("解除联锁", self.unlock_selected)
         unlocking.setEnabled(locked)
         if data["entry_id"] in self.problem_levels:
@@ -1569,25 +1574,26 @@ class MainWindow(QMainWindow):
         if any(member in self.lock_by_entry for member in members):
             self.statusBar().showMessage("部分条目已联锁。解除原有联锁后可重新组合。", 4500)
             return
-        if not self.can_reorder_manually():
+        filtered = self.plan_is_filtered()
+        if not filtered and not self.can_reorder_manually():
             return
         start = indices[0]
         title = f"{entries[start].name[:102]} · {len(indices)} 项"
         ordered = move_entries(entries, indices, start)
-        if quick:
+        if (quick or filtered) and ordered != entries:
             previous = {entry.id: i for i, entry in enumerate(entries, 1)}
             changes = [
-                f"#{previous[entry.id]:02d} → #{i:02d}  {entry.name}"
+                f"#{previous[entry.id]:02d} → #{i:02d}  {self.display_name(entry.reference, entry.name)}"
                 for i, entry in enumerate(ordered, 1) if previous[entry.id] != i
             ]
-            if changes and not confirmation_dialog(
+            if not confirmation_dialog(
                 self, "先看看哪些 Mod 会挪动",
                 "这些 Mod 分开在列表里。联锁会把它们移到第一项旁边。\n"
-                "列表靠上的 Mod 优先使用。请核对新位置。\n\n" + "\n".join(changes),
+                "以下是完整计划中的位置变化。列表靠上的 Mod 优先使用。\n\n" + "\n".join(changes),
                 "移动并联锁",
             ):
                 return
-        else:
+        if not quick:
             title, accepted = QInputDialog.getText(
                 self, "创建联锁", "输入联锁名称。选中项将按当前顺序相邻放置。", text=title,
             )
@@ -1749,21 +1755,56 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
         return selected
 
-    def edit_rules(self):
-        names = {entry.reference: self.display_name(entry.reference, entry.name)
-                 for entry in self.profile.entries + self.profile.staged}
-        names.update({mod.reference: self.display_name(mod.reference, mod.name) for mod in self.mods})
-        counts = Counter(names.values())
-        names = {
-            key: f"{name} · {key}" if counts[name] > 1 else name for key, name in names.items()
-        }
+    def rule_search_targets(self) -> dict[str, SearchRecord]:
+        by_reference = defaultdict(list)
+        for side in ("profile", "staging", "library"):
+            for record in self.search_records[side]:
+                mod, row = self.location_details(record.target)
+                reference = row.entry.reference if row else mod.reference
+                subject = mod or row.entry
+                if mod is None:
+                    record = replace(record, location=f"{record.location} · 待匹配")
+                by_reference[reference].append((record, subject.name, subject.path))
+
+        name_counts = Counter(
+            name for variants in by_reference.values() for name in set(variants[0][0].titles)
+        )
+        targets = {}
+        for reference, variants in by_reference.items():
+            primary, original, _ = variants[0]
+            title = f"{primary.title}（{original}）" if primary.title != original else primary.title
+            names = tuple(dict.fromkeys(name for record, _, _ in variants for name in record.titles))
+            locations = dict.fromkeys(record.location for record, _, _ in variants)
+            paths = dict.fromkeys(path for _, _, path in variants if path)
+            caption = " / ".join(locations)
+            if paths and (len(paths) > 1 or any(name_counts[name] > 1 for name in names)):
+                caption += "\n" + "\n".join(paths)
+            targets[reference] = replace(
+                primary, target=ModLocation("rule", reference), title=title, location=caption,
+                titles=names, details=search_text(" ".join(paths)),
+            )
+
         tags = [tag for mod in self.mods for tag in self.mod_tags(mod)]
         if self.tags:
             tags.extend(tag for values in self.tags.tags.values() for tag in values)
-        names.update(target_labels(self.profile, tags, self.settings.mod_colors.values()))
-        dialog = RuleDialog(self.profile.rules, names, self)
+        labels = target_labels(self.profile, tags, self.settings.mod_colors.values())
+        for reference, caption in sorted(labels.items(), key=lambda item: search_text(item[1])):
+            kind, _, name = caption.partition(" · ")
+            targets[reference] = SearchRecord.create(
+                ModLocation("rule", reference), caption, kind, (caption, name), None, kind, "",
+            )
+        return targets
+
+    def edit_rules(self, *, first="", second=""):
+        dialog = RuleDialog(self.profile.rules, self.rule_search_targets(), self, first=first, second=second)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.edit_profile("编辑排序规则", replace(self.profile, rules=dialog.result_rules()))
+
+    def edit_conflict_rule(self, first_id, second_id):
+        if first_id in self.plan_positions and second_id in self.plan_positions:
+            first = self.profile.entries[self.plan_positions[first_id]].reference
+            second = self.profile.entries[self.plan_positions[second_id]].reference
+            self.edit_rules(first=first, second=second)
 
     def configure_ai(self):
         previous = self.ai_provider

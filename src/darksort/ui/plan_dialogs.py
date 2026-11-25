@@ -20,16 +20,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QVBoxLayout,
 )
 
 from darksort.history import ProfileHistory, compare_entries
 from darksort.models import OrderRule, Profile
-from darksort.profiles import resolve_entries
+from darksort.profiles import MAX_RULES, resolve_entries
 from darksort.rule_targets import dynamic_target
+from darksort.search import SearchRecord
 from darksort.sorting import OrderPreview
 from darksort.ui.mod_list import ROLE
+from darksort.ui.search import GlobalSearchDialog
 from darksort.ui.theme import current_theme
 from darksort.ui.workspace_dock import data_table, decision_rows, fill_table
 from darksort.workshop import workshop_page
@@ -282,59 +285,120 @@ class HistoryDialog(QDialog):
 
 
 class RuleDialog(QDialog):
-    def __init__(self, rules: list[OrderRule], names: dict[str, str], parent=None):
+    def __init__(
+        self, rules: list[OrderRule], targets: dict[str, SearchRecord], parent=None, *, first="", second="",
+    ):
         super().__init__(parent)
-        self.names = names
-        self.setWindowTitle("方案排序规则")
-        self.resize(750, 510)
+        self.targets = targets
+        counts = Counter(record.title for record in targets.values())
+        self.names = {
+            key: f"{record.title} · {key}" if counts[record.title] > 1 else record.title
+            for key, record in targets.items()
+        }
+        self.selected: list[tuple[str, ...]] = [(), ()]
+        self.target_buttons = []
+        self.creating = bool(first)
+        self.setWindowTitle("添加排序规则" if self.creating else "方案排序规则")
         layout = QVBoxLayout(self)
         subtitle = QLabel("「在上方」可以选择 Mod、分组、标签或标记颜色。「依赖」可以选择两个具体 Mod。")
         subtitle.setObjectName("muted")
         layout.addWidget(subtitle)
-        self.list = QListWidget()
-        layout.addWidget(self.list)
+        self.list = QListWidget(self)
+        if self.creating:
+            self.resize(690, 260)
+            self.list.hide()
+        else:
+            self.resize(750, 510)
+            layout.addWidget(self.list)
         for rule in rules:
             self.add_row(rule)
         form = QFormLayout()
-        self.first = self.mod_combo()
-        self.second = self.mod_combo()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        for position, caption in enumerate(("目标 A", "目标 B")):
+            button = QPushButton()
+            button.setAccessibleName(caption)
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda _checked=False, position=position: self.pick_target(position))
+            self.target_buttons.append(button)
         self.relation = QComboBox()
         self.relation.addItem("在上方", "above")
         self.relation.addItem("依赖", "requires")
+        self.swap = QPushButton("交换 A/B")
+        self.swap.setAutoDefault(False)
+        self.swap.clicked.connect(self.swap_targets)
+        relation_controls = QHBoxLayout()
+        relation_controls.addWidget(self.relation, 1)
+        relation_controls.addWidget(self.swap)
         self.note = QLineEdit()
         self.note.setPlaceholderText("可选，例如补丁放在本体上方")
         self.note.setMaxLength(500)
-        form.addRow("目标 A", self.first)
-        form.addRow("关系", self.relation)
-        form.addRow("目标 B", self.second)
+        form.addRow("目标 A", self.target_buttons[0])
+        form.addRow("关系", relation_controls)
+        form.addRow("目标 B", self.target_buttons[1])
         form.addRow("说明", self.note)
         layout.addLayout(form)
-        actions = QHBoxLayout()
-        add = QPushButton("添加规则")
-        add.clicked.connect(self.add_rule)
-        actions.addWidget(add)
-        remove = QPushButton("移除所选")
-        remove.clicked.connect(self.remove_rule)
-        actions.addWidget(remove)
-        actions.addStretch()
-        layout.addLayout(actions)
+        if not self.creating:
+            actions = QHBoxLayout()
+            self.add = QPushButton("添加规则")
+            self.add.clicked.connect(self.add_rule)
+            actions.addWidget(self.add)
+            remove = QPushButton("移除所选")
+            remove.clicked.connect(self.remove_rule)
+            actions.addWidget(remove)
+            actions.addStretch()
+            layout.addLayout(actions)
         buttons = QDialogButtonBox()
-        buttons.addButton("保留规则", QDialogButtonBox.ButtonRole.AcceptRole)
+        if self.creating:
+            self.add = buttons.addButton("添加规则", QDialogButtonBox.ButtonRole.AcceptRole)
+        else:
+            buttons.addButton("保留规则", QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self.accept_new_rule if self.creating else self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.set_targets(0, (first,))
+        self.set_targets(1, (second,))
+        if not second:
+            self.target_buttons[1 if first else 0].setFocus()
 
-    def mod_combo(self):
-        combo = QComboBox()
-        combo.setEditable(True)
-        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        combo.setPlaceholderText("搜索 Mod、分组、标签或颜色")
-        for key, name in sorted(self.names.items(), key=lambda pair: pair[1].casefold()):
-            combo.addItem(name, key)
-        combo.setCurrentIndex(-1)
-        combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
-        return combo
+    def set_targets(self, position, references):
+        button = self.target_buttons[position]
+        selected = tuple(reference for reference in references if reference in self.targets)
+        self.selected[position] = selected
+        if not selected:
+            button.setText("搜索并选择…")
+            button.setToolTip("")
+        elif len(selected) == 1:
+            reference = selected[0]
+            record = self.targets[reference]
+            button.setText(self.names[reference])
+            button.setToolTip(f"{record.title}\n{record.location}")
+        else:
+            button.setText(f"已选 {len(selected)} 项 · {self.names[selected[0]]} 等")
+            button.setToolTip("\n".join(self.names[reference] for reference in selected))
+        self.swap.setEnabled(all(self.selected))
+        pairs = len(self.selected[0]) * len(self.selected[1])
+        self.add.setText(f"添加规则（{pairs} 组）" if pairs > 1 else "添加规则")
+
+    def pick_target(self, position):
+        other = set(self.selected[1 - position])
+        mods_only = self.relation.currentData() == "requires"
+        records = [
+            record for reference, record in self.targets.items()
+            if reference not in other and (not mods_only or not dynamic_target(reference))
+        ]
+        available = {record.target.identity: record.target for record in records}
+        dialog = GlobalSearchDialog(
+            records, self, rule_target=True,
+            selected=tuple(available[reference] for reference in self.selected[position] if reference in available),
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.chosen_targets:
+            self.set_targets(position, (target.identity for target in dialog.chosen_targets))
+
+    def swap_targets(self):
+        first, second = self.selected
+        self.set_targets(0, second)
+        self.set_targets(1, first)
 
     def add_row(self, rule: OrderRule):
         first = self.names.get(rule.first, "已移除的分组" if rule.first.startswith("group:") else rule.first)
@@ -349,30 +413,42 @@ class RuleDialog(QDialog):
             item.setText(f"{item.text()}  ·  {rule.note}")
         self.list.addItem(item)
 
-    def add_rule(self):
-        endpoints = []
-        for combo in (self.first, self.second):
-            index = combo.currentIndex()
-            if index < 0 or combo.currentText() != combo.itemText(index):
-                QMessageBox.information(self, "请选择目标", "从候选列表选中两个不同的目标。")
-                return
-            endpoints.append(combo.itemData(index))
-        first, second = endpoints
-        if first == second:
+    def add_rule(self) -> bool:
+        first, second = self.selected
+        left, right = set(first), set(second)
+        if not left or not right or left & right:
             QMessageBox.information(self, "请选择目标", "请为规则选择两个不同的目标。")
-            return
+            return False
         kind = self.relation.currentData()
-        if kind == "requires" and (dynamic_target(first) or dynamic_target(second)):
+        if kind == "requires" and any(dynamic_target(reference) for reference in left | right):
             QMessageBox.information(self, "请选择具体 Mod", "分组、标签和颜色用于「在上方」规则。")
-            return
+            return False
+        existing = {}
         for index in range(self.list.count()):
             item = self.list.item(index)
             rule = item.data(ROLE)
-            if (rule.first, rule.second, rule.kind) == (first, second, kind):
-                self.list.setCurrentItem(item)
-                return
-        self.add_row(OrderRule(first, second, kind, self.note.text().strip()))
+            if rule.kind == kind and rule.first in left and rule.second in right:
+                existing[(rule.first, rule.second)] = item
+        new_count = len(first) * len(second) - len(existing)
+        if not new_count:
+            self.list.setCurrentItem(next(iter(existing.values())))
+            if self.creating:
+                QMessageBox.information(self, "规则已存在", "可在「编辑用户规则」里查看或启用所选规则。")
+            return False
+        if self.list.count() + new_count > MAX_RULES:
+            QMessageBox.information(self, "排序规则过多", f"每份方案最多可保存 {MAX_RULES} 条排序规则。")
+            return False
+        note = self.note.text().strip()
+        for source in first:
+            for target in second:
+                if (source, target) not in existing:
+                    self.add_row(OrderRule(source, target, kind, note))
         self.note.clear()
+        return True
+
+    def accept_new_rule(self):
+        if self.add_rule():
+            self.accept()
 
     def remove_rule(self):
         for item in self.list.selectedItems():

@@ -20,8 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 from darksort.classification import Category
-from darksort.search import SearchRecord, search_text
+from darksort.search import ModLocation, SearchRecord, search_text
 from darksort.ui.theme import icon
+from darksort.workshop import workshop_link_id
 
 ROLE = Qt.ItemDataRole.UserRole
 RESULT_LIMIT = 250
@@ -276,69 +277,136 @@ class ListSearchBar(QFrame):
 
 
 class GlobalSearchDialog(QDialog):
-    def __init__(self, records: list[SearchRecord], parent=None):
+    def __init__(self, records: list[SearchRecord], parent=None, *, rule_target=False, selected=()):
         super().__init__(parent)
-        self.setWindowTitle("搜全部 · DarkSort")
+        self.setWindowTitle("选择规则目标" if rule_target else "搜全部 · DarkSort")
         self.resize(670, 483)
         self.records = records
+        self.rule_target = rule_target
         self.target = None
+        self.chosen_targets: tuple[ModLocation, ...] = ()
+        self.rule_selection = dict.fromkeys(selected) if selected else None
+        self.match_summary = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(13, 12, 13, 12)
         self.query = QLineEdit()
-        self.query.setPlaceholderText("搜索名称、标签、分类或 Workshop ID")
-        self.query.setAccessibleName("全局搜索 Mod")
+        self.query.setPlaceholderText(
+            "搜索原名、别名、Workshop ID，或粘贴工坊链接"
+            if rule_target else "搜索名称、标签、分类或 Workshop ID"
+        )
+        self.query.setAccessibleName("搜索规则目标" if rule_target else "全局搜索 Mod")
         self.query.setClearButtonEnabled(True)
         self.query.addAction(icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         self.query.textChanged.connect(self.refresh)
-        self.query.installEventFilter(self)
         layout.addWidget(self.query)
         self.summary = plain_label("")
         layout.addWidget(self.summary)
         self.results = QListWidget(objectName="globalResults")
-        self.results.setAccessibleName("全局搜索结果")
+        self.results.setAccessibleName("规则目标搜索结果" if rule_target else "全局搜索结果")
         self.results.itemActivated.connect(self.choose)
+        if rule_target:
+            self.results.installEventFilter(self)
+            self.results.viewport().installEventFilter(self)
         layout.addWidget(self.results, 1)
         controls = QDialogButtonBox()
-        self.jump = controls.addButton("跳转到 Mod", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.jump = controls.addButton(
+            "确认选择" if rule_target else "跳转到 Mod", QDialogButtonBox.ButtonRole.AcceptRole,
+        )
         self.jump.setObjectName("primary")
         controls.addButton("关闭", QDialogButtonBox.ButtonRole.RejectRole)
         controls.accepted.connect(lambda: self.choose(self.results.currentItem()))
         controls.rejected.connect(self.reject)
-        self.results.currentItemChanged.connect(lambda item, _: self.jump.setEnabled(item is not None))
+        self.results.currentItemChanged.connect(lambda *_: self.update_selection_feedback())
         layout.addWidget(controls)
+        self.query.installEventFilter(self)
         self.refresh("")
         self.query.setFocus()
 
     def refresh(self, text):
         query = search_text(text)
         matched = []
-        if query:
+        workshop = workshop_link_id(text) if self.rule_target else None
+        if workshop:
+            matched = [(0, record) for record in self.records if record.workshop_id == workshop]
+        elif query:
             matched = [(rank, record) for record in self.records if (rank := record.rank(query)) is not None]
             matched.sort(key=lambda item: item[0])
-        self.results.clear()
-        for _, record in matched[:RESULT_LIMIT]:
-            item = QListWidgetItem(f"{record.title}\n{record.location}")
-            item.setData(ROLE, record.target)
-            self.results.addItem(item)
-        if self.results.count():
-            self.results.setCurrentRow(0)
+        elif self.rule_target:
+            matched = [(0, record) for record in self.records]
+        with QSignalBlocker(self.results):
+            self.results.clear()
+            for _, record in matched[:RESULT_LIMIT]:
+                item = QListWidgetItem(f"{record.title}\n{record.location}")
+                item.setData(ROLE, record.target)
+                if self.rule_target:
+                    item.setToolTip(item.text())
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                    self.update_rule_check(item)
+                self.results.addItem(item)
+            if self.results.count():
+                self.results.setCurrentRow(0)
         more = f" · 显示前 {RESULT_LIMIT} 项" if len(matched) > RESULT_LIMIT else ""
-        self.summary.setText(f"{len(matched)} 项{more}" if query else "查找可用库、计划和暂存篮中的 Mod")
-        self.jump.setEnabled(bool(self.results.count()))
+        self.match_summary = (
+            f"{len(matched)} 项{more}" if query or self.rule_target else "查找可用库、计划和暂存篮中的 Mod"
+        )
+        self.update_selection_feedback()
+
+    def update_selection_feedback(self):
+        summary = self.match_summary
+        if self.rule_target:
+            summary += f" · 已选 {len(self.rule_selection or ())} 项 · 按住 Shift 逐项点选"
+        self.summary.setText(summary)
+        ready = self.results.currentItem() is not None if self.rule_selection is None else bool(self.rule_selection)
+        self.jump.setEnabled(ready)
+
+    def update_rule_check(self, item):
+        checked = self.rule_selection is not None and item.data(ROLE) in self.rule_selection
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
+    def select_rule_result(self, item, *, toggle):
+        if not toggle or self.rule_selection is None:
+            self.rule_selection = {}
+        target = item.data(ROLE)
+        if toggle and target in self.rule_selection:
+            del self.rule_selection[target]
+        else:
+            self.rule_selection[target] = None
+        for row in range(self.results.count()):
+            self.update_rule_check(self.results.item(row))
+        self.update_selection_feedback()
 
     def choose(self, item):
+        if self.rule_target and self.rule_selection is not None:
+            if self.rule_selection:
+                self.chosen_targets = tuple(self.rule_selection)
+                self.accept()
+            return
         if item is not None:
             self.target = item.data(ROLE)
+            self.chosen_targets = (self.target,)
             self.accept()
 
     def eventFilter(self, watched, event):
-        if watched is self.query and event.type() == QEvent.Type.KeyPress and self.results.count():
-            key = event.key()
-            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-                offset = 1 if key == Qt.Key.Key_Down else -1
-                self.results.setCurrentRow((self.results.currentRow() + offset) % self.results.count())
+        mouse_events = (QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick)
+        if (self.rule_target and watched is self.results.viewport() and event.type() in mouse_events
+                and event.button() == Qt.MouseButton.LeftButton):
+            toggle = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if toggle and event.type() == QEvent.Type.MouseButtonDblClick:
                 return True
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                if item := self.results.itemAt(event.position().toPoint()):
+                    self.select_rule_result(item, toggle=toggle)
+        if (self.rule_target and watched is self.results and event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Space and self.results.currentItem() is not None):
+            self.select_rule_result(self.results.currentItem(), toggle=True)
+            return True
+        if watched is self.query and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self.choose(self.results.currentItem())
+                return True
+            if self.results.count() and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                offset = 1 if key == Qt.Key.Key_Down else -1
+                self.results.setCurrentRow((self.results.currentRow() + offset) % self.results.count())
                 return True
         return super().eventFilter(watched, event)

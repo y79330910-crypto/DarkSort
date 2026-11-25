@@ -17,6 +17,7 @@ class PlanProblem:
     advice: str
     targets: tuple[tuple[str, str], ...]
     details: str = ""
+    order_pair: tuple[str, str] | None = None
 
     @cached_property
     def key(self) -> str:
@@ -77,12 +78,18 @@ def explain_files(entries: list[ResolvedEntry], report: ConflictReport):
             winner = hit.winner
             resource = {".info.darkest": "英雄数值", ".art.darkest": "英雄外观"}
             name = next((label for suffix, label in resource.items() if hit.path.endswith(suffix)), "英雄设置")
+            order_pair = None
+            if len(candidates) == 2:
+                loser = next(p for p in candidates if p != winner)
+                first, second = entries[winner.rank - 1].entry, entries[loser.rank - 1].entry
+                if first.reference != second.reference:
+                    order_pair = (first.id, second.id)
             yield PlanProblem(
                 "warning", f"{name}文件被覆盖",
                 f"「{winner.mod.name}」排得更靠上，游戏用它的这份文件。",
                 "想用另一份，把对应的 Mod 放到上面。",
                 tuple((entries[p.rank - 1].entry.id, "生效" if p == winner else "被覆盖")
-                      for p in candidates), hit.path,
+                      for p in candidates), hit.path, order_pair=order_pair,
             )
         elif hit.status == FileStatus.UNKNOWN and len({p.rank for p in candidates}) > 1:
             yield PlanProblem(

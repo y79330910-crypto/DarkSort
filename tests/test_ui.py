@@ -533,6 +533,107 @@ def menu_action(menu, text):
     return next(action for action in menu.actions() if action.text() == text)
 
 
+def test_plan_context_adds_rule_using_exact_target_search(qtbot, tmp_path, mods, monkeypatch):
+    first = mods[0]
+    original = "Camp Helper"
+    second = replace(mods[1], name=original)
+    same_name = replace(mods[2], name=original)
+    window = make_window(qtbot, tmp_path, [first, second, same_name])
+    window.add_keys([first.key, second.key])
+    window.save_mod_display({second.reference: "营地助手"}, {})
+    window.render_lists()
+
+    def choose(dialog):
+        assert dialog.rule_target
+        assert first.reference not in {record.target.identity for record in dialog.records}
+        dialog.query.setText(original)
+        captions = [dialog.results.item(index).text() for index in range(dialog.results.count())]
+        assert len(captions) == 2
+        assert "营地助手" in captions[0] and "计划 #2" in captions[0] and second.path in captions[0]
+        assert "可用" in captions[1] and same_name.path in captions[1]
+        for query in (
+            "营地助手",
+            "１００２",
+            "steam://url/CommunityFilePage/1002",
+            "https://steamcommunity.com/sharedfiles/filedetails/?id=1002&searchtext=camp",
+        ):
+            dialog.query.setText(query)
+            assert dialog.results.count() == 1
+            assert dialog.results.item(0).data(ROLE).identity == second.reference
+        dialog.choose(dialog.results.item(0))
+        return dialog.result()
+
+    def add(dialog):
+        assert dialog.selected == [(first.reference,), ()]
+        dialog.show()
+        target_button = dialog.target_buttons[1]
+        assert target_button.isVisible() and target_button.width() >= 160
+        qtbot.mouseClick(target_button, Qt.MouseButton.LeftButton)
+        assert dialog.selected == [(first.reference,), (second.reference,)]
+        dialog.accept_new_rule()
+        return dialog.result()
+
+    monkeypatch.setattr("darksort.ui.search.GlobalSearchDialog.exec", choose)
+    monkeypatch.setattr("darksort.ui.plan_dialogs.RuleDialog.exec", add)
+    menu = open_mod_context(qtbot, window.profile_list, 0)
+    menu_action(menu, "添加排序规则…").trigger()
+    menu.hide()
+    assert window.profile.rules == [OrderRule(first.reference, second.reference)]
+    window.undo_stack.undo()
+    assert not window.profile.rules
+
+
+def test_rule_targets_shift_click_individually_across_searches(qtbot, tmp_path, mods, monkeypatch):
+    source, first, middle = mods
+    last = replace(first, name="其他配套", workshop_id="1003", path=str(tmp_path / "1003"))
+    installed = [source, first, middle, last]
+    window = make_window(qtbot, tmp_path, installed)
+    window.add_keys([mod.key for mod in installed])
+
+    def choose(dialog):
+        dialog.show()
+        view = dialog.results
+
+        def shift_click(row):
+            qtbot.mouseClick(
+                view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier,
+                pos=view.visualItemRect(view.item(row)).center(),
+            )
+
+        shift_click(0)
+        shift_click(2)
+        assert [view.item(row).checkState() for row in range(3)] == [
+            Qt.CheckState.Checked, Qt.CheckState.Unchecked, Qt.CheckState.Checked,
+        ]
+        shift_click(2)
+        assert view.item(2).checkState() == Qt.CheckState.Unchecked
+        shift_click(0)
+        assert not dialog.jump.isEnabled()
+        shift_click(0)
+        dialog.query.setText(last.name)
+        assert view.count() == 1 and view.item(0).checkState() == Qt.CheckState.Unchecked
+        shift_click(0)
+        dialog.query.setText("没有匹配项")
+        assert view.count() == 0 and dialog.jump.isEnabled() and "已选 2 项" in dialog.summary.text()
+        dialog.jump.click()
+        return dialog.result()
+
+    def add(dialog):
+        dialog.target_buttons[1].click()
+        assert dialog.selected == [(source.reference,), (first.reference, last.reference)]
+        assert "2 组" in dialog.add.text()
+        dialog.accept_new_rule()
+        return dialog.result()
+
+    monkeypatch.setattr("darksort.ui.search.GlobalSearchDialog.exec", choose)
+    monkeypatch.setattr("darksort.ui.plan_dialogs.RuleDialog.exec", add)
+    window.edit_rules(first=source.reference)
+    assert window.profile.rules == [
+        OrderRule(source.reference, first.reference),
+        OrderRule(source.reference, last.reference),
+    ]
+
+
 def test_linked_mod_folder_and_metadata_actions_follow_clicked_row(qtbot, tmp_path, mods, monkeypatch):
     window = make_window(qtbot, tmp_path, mods)
     window.add_keys([mod.key for mod in mods])
@@ -808,7 +909,50 @@ def test_right_click_preserves_multiselect_and_creates_visible_lock(qtbot, tmp_p
     assert not window.profile.locks and window.profile.entries == [a, c, b]
 
 
-def test_badges_explain_and_follow_current_dd1_priority(qtbot, tmp_path, mods):
+@pytest.mark.parametrize("separated", [False, True], ids=["adjacent", "separated"])
+def test_right_click_locks_selected_plan_entries_while_filtered(
+    qtbot, tmp_path, mods, monkeypatch, separated,
+):
+    first = replace(mods[0], name="配套本体")
+    patch = replace(mods[2], name="配套补丁")
+    hidden = mods[1]
+    ordered = [first, hidden, patch] if separated else [first, patch, hidden]
+    window = make_window(qtbot, tmp_path, ordered)
+    window.add_keys([mod.key for mod in ordered])
+    before = window.profile.entries.copy()
+    filter_list(window.profile_search, "配套")
+    view = window.profile_list
+    assert view.count() == 2 and view.reorder_blocked
+    view.item(0).setSelected(True)
+    view.item(1).setSelected(True)
+    previews = []
+
+    def confirm(_parent, _title, changes, _action):
+        previews.append(changes)
+        return len(previews) == 2
+
+    monkeypatch.setattr("darksort.ui.main_window.confirmation_dialog", confirm)
+    menu = open_mod_context(qtbot, view, 1)
+    action = menu_action(menu, "联锁选中项")
+    assert action.isEnabled()
+    if separated:
+        action.trigger()
+        assert window.profile.entries == before and not window.profile.locks
+        assert f"#02 → #03  {hidden.name}" in previews[0]
+        assert f"#03 → #02  {patch.name}" in previews[0]
+    action.trigger()
+    menu.hide()
+    assert len(previews) == (2 if separated else 0)
+    assert [entry.name for entry in window.profile.entries] == [first.name, patch.name, hidden.name]
+    assert window.profile.locks[0].members == tuple(entry.id for entry in window.profile.entries[:2])
+    assert window.profile_search.filter_query == "配套" and view.count() == 2
+    assert view.reorder_blocked
+    window.undo_stack.undo()
+    assert window.profile.entries == before and not window.profile.locks
+    assert window.profile_search.filter_query == "配套"
+
+
+def test_badges_explain_and_follow_current_dd1_priority(qtbot, tmp_path, mods, monkeypatch):
     relative = "heroes/crusader/crusader.info.darkest"
     for index, mod in enumerate(mods):
         root = Path(mod.path)
@@ -838,6 +982,19 @@ def test_badges_explain_and_follow_current_dd1_priority(qtbot, tmp_path, mods):
     assert panel.title.text() == "英雄数值文件被覆盖"
     assert "甲 Mod" in panel.message.text()
     assert panel.targets.item(1).text().startswith("被覆盖")
+    assert not panel.rule.isHidden()
+    prefilled = []
+
+    def read_rule(dialog):
+        prefilled.append(tuple(selection[0] for selection in dialog.selected))
+        dialog.swap.click()
+        assert dialog.selected == [(mods[1].reference,), (mods[0].reference,)]
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr("darksort.ui.plan_dialogs.RuleDialog.exec", read_rule)
+    panel.rule.click()
+    assert prefilled == [(mods[0].reference, mods[1].reference)]
+    assert len(window.profile.rules) == 1
     assert panel.technical.isHidden()
     panel.files.click()
     assert panel.technical.toPlainText() == relative
@@ -852,6 +1009,7 @@ def test_badges_explain_and_follow_current_dd1_priority(qtbot, tmp_path, mods):
     window.problem_buttons["error"].click()
     assert view.count() == 1 and view.item(0).data(ROLE)["number"] == 3
     assert panel.title.text() == "少了一个需要的 Mod"
+    assert panel.rule.isHidden()
     window.clear_problem_button.click()
     assert view.count() == 3
 

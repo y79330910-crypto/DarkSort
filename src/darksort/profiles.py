@@ -26,6 +26,7 @@ FORMAT = "darksort.profile"
 GROUPS_VERSION = 4
 VERSION = 5
 MAX_ENTRIES = 20000
+MAX_RULES = 20000
 MAX_PROFILE_BYTES = 8 * 1024 * 1024
 
 
@@ -89,7 +90,7 @@ def parse_profile(data: dict) -> Profile:
         groups.append(ProfileGroup(anchor, title.strip()))
 
     rules = []
-    for item in profile_list(data, "rules", 20000):
+    for item in profile_list(data, "rules", MAX_RULES):
         first, second = item.get("first"), item.get("second")
         if not all(isinstance(key, str) and 0 < len(key) <= 32780 for key in (first, second)):
             raise ValueError("排序规则的 Mod 标识无效。")
