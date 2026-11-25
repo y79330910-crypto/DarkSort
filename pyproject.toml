@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "darksort"
-version = "0.13.0"
+version = "0.13.1"
 description = "Darkest Dungeon 1 local mod profile manager for Windows"
 requires-python = ">=3.12"
 dependencies = [

@@ -1,9 +1,11 @@
+import json
 import sqlite3
 
 import pytest
 import vdf
 
-from darksort.models import ScanRoot, Source
+from darksort.models import ProfileEntry, ScanRoot, Source
+from darksort.profiles import ProfileStore
 from darksort.scanning.discovery import discover
 from darksort.scanning.metadata import parse_mod
 from darksort.scanning.scanner import scan
@@ -54,11 +56,15 @@ def test_old_broken_or_entity_xml_is_visible_and_warned(tmp_path, xml):
     assert mod.warnings
 
 
-def test_template_without_workshop_fields_is_valid_local_mod(tmp_path):
-    project(tmp_path, "<project><Title>Local</Title><VersionMajor>1</VersionMajor></project>")
+@pytest.mark.parametrize("metadata", ["", "<PublishedFileId/>", "<PublishedFileId>  </PublishedFileId>"])
+def test_local_mod_without_workshop_id_can_be_saved(tmp_path, metadata):
+    project(tmp_path, f"<project><Title>Local</Title>{metadata}</project>")
     mod = parse_mod(tmp_path, Source.LOCAL)
     assert not mod.warnings
     assert mod.workshop_id is None
+    store = ProfileStore(tmp_path / "data")
+    profile = store.new("Local", [ProfileEntry.from_mod(mod)])
+    assert store.load(profile.id).entries[0].workshop_id is None
 
 
 def test_preview_cannot_escape_mod_folder(tmp_path):
@@ -159,3 +165,21 @@ def test_invalid_cached_payload_falls_back_to_metadata(tmp_path):
     result = scan([ScanRoot(root, Source.LOCAL)], cache)
     assert result.mods[0].name == "Safe"
     assert not result.cache_hits
+
+
+def test_legacy_cached_empty_workshop_id_is_rebuilt(tmp_path):
+    root = tmp_path / "mods"
+    project(root / "one", "<project><Title>Local</Title><PublishedFileId/></project>")
+    roots = [ScanRoot(root, Source.LOCAL)]
+    cache = tmp_path / "cache.sqlite3"
+    mod = scan(roots, cache).mods[0]
+    old_payload = mod.to_dict() | {"workshop_id": ""}
+    with sqlite3.connect(cache) as db:
+        db.execute("UPDATE mod_cache SET payload=?", (json.dumps(old_payload),))
+
+    result = scan(roots, cache)
+    assert result.cache_hits == 0
+    assert result.mods[0].workshop_id is None
+    cached = scan(roots, cache)
+    assert cached.cache_hits == 1
+    assert cached.mods[0].workshop_id is None

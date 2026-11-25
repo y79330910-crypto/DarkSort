@@ -48,7 +48,8 @@ class ScanCache:
             return None
         try:
             mod = Mod.from_dict(json.loads(row[0]))
-            if mod.key != key:
+            # Older scans could cache a blank PublishedFileId as an empty string.
+            if mod.key != key or mod.workshop_id == "":
                 return None
             if mod.preview_path and not Path(mod.preview_path).is_file():
                 return None

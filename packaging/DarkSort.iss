@@ -7,6 +7,7 @@ AppId=DarkSort
 AppName=DarkSort
 AppVersion={#AppVersion}
 DefaultDirName={localappdata}\Programs\DarkSort
+UsePreviousAppDir=yes
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible

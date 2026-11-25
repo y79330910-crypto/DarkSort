@@ -1,12 +1,14 @@
-# DarkSort v0.13.0
+# DarkSort v0.13.1
 
 面向 Windows 的《暗黑地牢 1》Mod 管理器。它从 Steam 游戏库和指定目录读取 Mod，按方案组织加载顺序，并支持从选定档位导入或应用顺序。
 
 ## 启动
 
-双击 `dist/DarkSort-0.13.0-Setup.exe`，按向导安装。默认安装到 `%LOCALAPPDATA%\Programs\DarkSort`，无需管理员权限。安装后可从桌面或开始菜单启动。可在 Windows「设置 → 应用 → 已安装的应用」中卸载，方案和备份保存在单独的数据目录。
+双击 `dist/DarkSort-0.13.1-Setup.exe`，按向导安装。默认安装到 `%LOCALAPPDATA%\Programs\DarkSort`，无需管理员权限。安装后可从桌面或开始菜单启动。可在 Windows「设置 → 应用 → 已安装的应用」中卸载，方案和备份保存在单独的数据目录。
 
-也可双击项目里的 `启动DarkSort.cmd`。Windows 便携版在 `dist/DarkSort-0.13.0-windows-x64.zip` 中。完整解压，保留 `_internal`，再运行 `DarkSort.exe`。安装版和便携版都包含运行所需的 Python 和 Qt，并使用同一个默认数据目录。
+已安装的用户先保存方案并关闭 DarkSort，再运行新版安装包，沿用向导显示的原安装目录。方案、设置、历史快照和存档备份会继续从 `%LOCALAPPDATA%\DarkSort` 读取。使用自定义 `--data-dir` 启动的用户请沿用原目录。
+
+也可双击项目里的 `启动DarkSort.cmd`。Windows 便携版在 `dist/DarkSort-0.13.1-windows-x64.zip` 中。完整解压，保留 `_internal`，再运行 `DarkSort.exe`。安装版和便携版都包含运行所需的 Python 和 Qt，并使用同一个默认数据目录。
 
 源码环境需要 Python 3.12+ 和 uv。
 

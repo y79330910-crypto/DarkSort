@@ -37,7 +37,7 @@ def parse_mod(folder: Path, source: Source) -> Mod:
     name = fields.get("title") or folder.name
     if fields and not fields.get("title"):
         warnings.append("缺少标题，使用目录名。")
-    workshop_id = fields.get("publishedfileid")
+    workshop_id = fields.get("publishedfileid") or None
     if workshop_id and (
         not workshop_id.isascii()
         or not workshop_id.isdecimal()
