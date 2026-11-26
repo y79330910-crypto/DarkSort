@@ -277,12 +277,13 @@ class ListSearchBar(QFrame):
 
 
 class GlobalSearchDialog(QDialog):
-    def __init__(self, records: list[SearchRecord], parent=None, *, rule_target=False, selected=()):
+    def __init__(self, records: list[SearchRecord], parent=None, *, rule_target=False, selected=(), pick_mod=False):
         super().__init__(parent)
         self.setWindowTitle("选择规则目标" if rule_target else "搜全部 · DarkSort")
         self.resize(670, 483)
         self.records = records
         self.rule_target = rule_target
+        self.pick_mod = pick_mod
         self.target = None
         self.chosen_targets: tuple[ModLocation, ...] = ()
         self.rule_selection = dict.fromkeys(selected) if selected else None
@@ -292,7 +293,7 @@ class GlobalSearchDialog(QDialog):
         self.query = QLineEdit()
         self.query.setPlaceholderText(
             "搜索原名、别名、Workshop ID，或粘贴工坊链接"
-            if rule_target else "搜索名称、标签、分类或 Workshop ID"
+            if rule_target or pick_mod else "搜索名称、标签、分类或 Workshop ID"
         )
         self.query.setAccessibleName("搜索规则目标" if rule_target else "全局搜索 Mod")
         self.query.setClearButtonEnabled(True)
@@ -310,7 +311,7 @@ class GlobalSearchDialog(QDialog):
         layout.addWidget(self.results, 1)
         controls = QDialogButtonBox()
         self.jump = controls.addButton(
-            "确认选择" if rule_target else "跳转到 Mod", QDialogButtonBox.ButtonRole.AcceptRole,
+            "确认选择" if rule_target or pick_mod else "跳转到 Mod", QDialogButtonBox.ButtonRole.AcceptRole,
         )
         self.jump.setObjectName("primary")
         controls.addButton("关闭", QDialogButtonBox.ButtonRole.RejectRole)
@@ -325,13 +326,13 @@ class GlobalSearchDialog(QDialog):
     def refresh(self, text):
         query = search_text(text)
         matched = []
-        workshop = workshop_link_id(text) if self.rule_target else None
+        workshop = workshop_link_id(text) if self.rule_target or self.pick_mod else None
         if workshop:
             matched = [(0, record) for record in self.records if record.workshop_id == workshop]
         elif query:
             matched = [(rank, record) for record in self.records if (rank := record.rank(query)) is not None]
             matched.sort(key=lambda item: item[0])
-        elif self.rule_target:
+        elif self.rule_target or self.pick_mod:
             matched = [(0, record) for record in self.records]
         with QSignalBlocker(self.results):
             self.results.clear()
@@ -347,7 +348,7 @@ class GlobalSearchDialog(QDialog):
                 self.results.setCurrentRow(0)
         more = f" · 显示前 {RESULT_LIMIT} 项" if len(matched) > RESULT_LIMIT else ""
         self.match_summary = (
-            f"{len(matched)} 项{more}" if query or self.rule_target else "查找可用库、计划和暂存篮中的 Mod"
+            f"{len(matched)} 项{more}" if query or self.rule_target or self.pick_mod else "查找可用库、计划和分组中的 Mod"
         )
         self.update_selection_feedback()
 

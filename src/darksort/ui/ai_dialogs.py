@@ -243,18 +243,23 @@ class AISettingsDialog(QDialog):
 
 
 class ModTextDialog(QDialog):
-    def __init__(self, owner, mod, alias, translation):
+    def __init__(self, owner, mod, alias, translation, note=""):
         super().__init__(owner)
+        from darksort.settings import MAX_MOD_NOTE
+
         self.owner, self.mod = owner, mod
         self.clear_requested = False
-        self.setWindowTitle("Mod 别名与中文简介")
+        self.setWindowTitle("编辑 Mod 别名、简介与备注")
         self.resize(730, 460)
-        layout = dialog_layout(self, "Mod 别名与中文简介")
+        layout = dialog_layout(self, "编辑 Mod 文本")
         layout.addWidget(plain_label(f"原名 · {mod.name}"))
         self.alias = QLineEdit(alias, maxLength=MAX_ALIAS)
         self.alias.setPlaceholderText("在列表和详情中显示的短名称")
         form = QFormLayout()
         form.addRow("显示别名", self.alias)
+        self.note = QLineEdit(note, maxLength=MAX_MOD_NOTE)
+        self.note.setPlaceholderText("仅自己查看的备注")
+        form.addRow("备注", self.note)
         layout.addLayout(form)
         panes = QHBoxLayout()
         original = QVBoxLayout()
@@ -319,6 +324,7 @@ class ModTextDialog(QDialog):
         self.clear_requested = True
         self.alias.clear()
         self.translation.clear()
+        self.note.clear()
 
     def text_values(self):
         return self.alias.text().strip(), self.translation.toPlainText().strip()

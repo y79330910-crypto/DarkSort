@@ -39,6 +39,15 @@ class SaveBindings:
             mapping.pop(key, None)
         else:
             mapping[key] = str(UUID(profile_id))
+        self.write(mapping)
+
+    def remove_profile(self, profile_id: str) -> None:
+        mapping = self.read()
+        remaining = {key: identity for key, identity in mapping.items() if identity != profile_id}
+        if len(remaining) != len(mapping):
+            self.write(remaining)
+
+    def write(self, mapping: dict[str, str]) -> None:
         atomic_json(self.file, {"version": 1, "slots": mapping})
 
 

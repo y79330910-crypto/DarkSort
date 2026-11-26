@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSignalBlocker, QSize, Qt
+from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QKeySequence, QPainter
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QToolButton,
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from darksort.settings import MARK_COLORS
+from darksort.settings import MARK_COLORS, MAX_MOD_NOTE
 from darksort.ui.appearance import ModArtwork, TagChips
 from darksort.ui.conflict_dialog import ConflictPanel
 from darksort.ui.group_panel import GroupShelf
@@ -74,6 +75,17 @@ class WorkspaceCombo(QComboBox):
         painter.end()
 
 
+class DetailTitle(QLabel):
+    edit_requested = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.edit_requested.emit()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+
 def build_workbench(window):
     create_menus(window)
     central = QWidget()
@@ -86,16 +98,22 @@ def build_workbench(window):
     window.workspace_split = QSplitter(Qt.Orientation.Vertical)
     window.workspace_split.setHandleWidth(8)
     window.panes = QSplitter(Qt.Orientation.Horizontal)
+    window.panes.setObjectName("workbenchPanes")
     window.panes.setHandleWidth(8)
-    window.panes.setChildrenCollapsible(False)
     window.detail_panel = create_details(window)
     window.panes.addWidget(window.detail_panel)
     window.panes.addWidget(create_library(window))
     window.panes.addWidget(create_plan(window))
     window.utility = UtilityPane(window)
     window.panes.addWidget(window.utility)
-    window.panes.setSizes([246, 283, 650, 282])
-    window.panes.setStretchFactor(2, 1)
+    for index in range(window.panes.count()):
+        pane = window.panes.widget(index)
+        pane.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        # Qt distinguishes a collapsed pane from a narrow pane using its minimum size.
+        pane.setMinimumWidth(1)
+        window.panes.setStretchFactor(index, 1)
+    window.panes.setSizes(window.settings.pane_sizes or [246, 283, 650, 282])
+    window.panes.splitterMoved.connect(window.remember_pane_sizes)
     window.workspace_split.addWidget(window.panes)
     window.dock = WorkspaceDock(window)
     window.workspace_split.addWidget(window.dock)
@@ -130,6 +148,7 @@ def create_menus(window):
     file = menu.addMenu("文件")
     file.addAction("新建方案…", window.new_profile)
     file.addAction("复制当前方案…", window.duplicate_profile)
+    file.addAction("管理方案…", window.manage_profiles)
     file.addSeparator()
     file.addAction("导入方案…", window.import_profile)
     file.addAction("导出方案…", window.export_profile)
@@ -152,9 +171,7 @@ def create_menus(window):
     edit.addAction("搜全部…", window.search_all)
     edit.addAction("加入所选", window.add_selected)
     edit.addAction("加入所有可见 Mod", window.add_visible)
-    edit.addAction("暂存所选可用 Mod", window.stage_available)
     edit.addAction("移除所选", window.remove_selected)
-    edit.addAction("暂存计划所选", window.stage_plan)
     edit.addAction("上移", lambda: window.nudge(-1))
     edit.addAction("下移", lambda: window.nudge(1))
     edit.addSeparator()
@@ -165,12 +182,18 @@ def create_menus(window):
 
     view = menu.addMenu("视图")
     view.addAction("界面主题…", window.edit_appearance)
+    view.addAction("右键菜单设置…", lambda: window.configure_context_menu())
     view.addAction("显示或隐藏 Mod 详情", window.toggle_details)
+    view.addAction("显示或隐藏可用 Mod", lambda: window.toggle_pane(window.panes.widget(1)))
+    view.addAction("显示或隐藏计划顺序", lambda: window.toggle_pane(window.panes.widget(2)))
     view.addAction("显示或隐藏工作区", window.toggle_utility)
     view.addAction("显示或隐藏诊断面板", window.toggle_dock)
 
     tools = menu.addMenu("工具")
     window.path_button = tools.addAction("扫描路径…", window.edit_paths)
+    tools.addAction("新建空模组…", window.create_empty_mod)
+    tools.addAction("工坊 Mod 转为本地…", window.convert_workshop_mod)
+    tools.addAction("游戏文件替换…", window.open_file_replacements)
     window.refresh_button = tools.addAction("强制刷新", lambda: window.start_scan(refresh=True))
     tools.addAction("用户规则…", window.edit_rules)
     tools.addSeparator()
@@ -191,12 +214,14 @@ def create_menus(window):
     window.batch_text_progress_action.setEnabled(False)
 
     help_ = menu.addMenu("帮助")
+    guide = help_.addAction("功能与入口…", window.show_feature_guide)
+    guide.setShortcut(QKeySequence.StandardKey.HelpContents)
     help_.addAction(
         "键盘快捷键",
         lambda: window.show_text(
             "键盘快捷键",
             "Ctrl+S   保存方案\nCtrl+Z   撤销\nCtrl+Y / Ctrl+Shift+Z   重做\n"
-            "Ctrl+F   搜全部\nF5          扫描 Mod\n"
+            "Ctrl+F   搜全部\nF1          功能与入口\nF5          扫描 Mod\n"
             "Ctrl+A    全选列表\nCtrl / Shift   多选\nShift+F10    打开 Mod 菜单",
         ),
     )
@@ -214,13 +239,15 @@ def create_toolbar(window):
     window.profile_combo.setMaximumWidth(176)
     window.profile_combo.currentIndexChanged.connect(window.switch_profile)
     lane.addWidget(window.profile_combo)
+    window.profile_manager_button = button("管理方案…", window.manage_profiles, name="manageProfiles")
+    lane.addWidget(window.profile_manager_button)
     window.scan_button = button("扫描", window.start_scan, glyph="refresh")
     lane.addWidget(window.scan_button)
     lane.addWidget(QFrame(objectName="rule"))
 
     search_all = button("搜全部   Ctrl+F", window.search_all, name="globalSearch", glyph="search")
     search_all.setAccessibleName("搜全部")
-    search_all.setToolTip("在可用、计划和暂存中查找 Mod")
+    search_all.setToolTip("在可用、计划和分组中查找 Mod")
     lane.addWidget(search_all)
     lane.addStretch(1)
     lane.addWidget(button("智能排序", lambda: window.sort_profile(), glyph="sort", name="sortNow"))
@@ -249,7 +276,6 @@ def create_toolbar(window):
 
 def create_library(window):
     panel, layout = frame("panel", vertical=True, margins=(1, 1, 1, 1))
-    panel.setMinimumWidth(199)
     header, band = frame("paneHeader", margins=(11, 7, 10, 7), spacing=6)
     window.library_title = label("可用 Mod", "panelTitle")
     band.addWidget(window.library_title, 1)
@@ -268,7 +294,6 @@ def create_library(window):
     layout.addWidget(window.library_list, 1)
     footer, actions = frame("paneFooter", margins=(7, 6, 7, 6), spacing=5)
     actions.addWidget(button("加入 →", window.add_selected, primary=True))
-    actions.addWidget(button("暂存", window.stage_available))
     actions.addStretch()
     window.library_selection = label("", "smallCaps")
     actions.addWidget(window.library_selection)
@@ -278,7 +303,6 @@ def create_library(window):
 
 def create_plan(window):
     panel, layout = frame("panel", vertical=True, margins=(1, 1, 1, 1))
-    panel.setMinimumWidth(321)
     header, band = frame("paneHeader", margins=(11, 7, 10, 7), spacing=7)
     window.selected_title = label("计划顺序", "panelTitle")
     band.addWidget(window.selected_title)
@@ -316,7 +340,7 @@ def create_plan(window):
     layout.addWidget(window.profile_list, 1)
     footer, actions = frame("paneFooter", margins=(7, 6, 7, 6), spacing=5)
     remove = button("← 移出", window.remove_selected)
-    remove.setToolTip("移出所选项。联锁成员会一起移入暂存篮。")
+    remove.setToolTip("移出所选项。联锁成员会一起停用，可在分组中重新启用。")
     actions.addWidget(remove)
     actions.addWidget(button("↑", lambda: window.nudge(-1)))
     actions.addWidget(button("↓", lambda: window.nudge(1)))
@@ -343,8 +367,6 @@ def create_column_search(window, side):
 
 def create_details(window):
     panel, layout = frame("panel", vertical=True, margins=(1, 1, 1, 1))
-    panel.setMinimumWidth(205)
-    panel.setMaximumWidth(380)
     header, band = frame("paneHeader", margins=(11, 7, 10, 7))
     band.addWidget(label("MOD 详情", "panelTitle"))
     band.addStretch()
@@ -359,9 +381,16 @@ def create_details(window):
     window.detail_art = ModArtwork()
     window.detail_art.clicked.connect(window.preview_cover)
     details.addWidget(window.detail_art)
-    window.detail_title = label("选择一个 Mod", "detailTitle")
+    window.detail_title = DetailTitle("选择一个 Mod", objectName="detailTitle")
+    window.detail_title.setTextFormat(Qt.TextFormat.PlainText)
     window.detail_title.setWordWrap(True)
+    window.detail_title.edit_requested.connect(window.edit_mod_text)
     details.addWidget(window.detail_title)
+    window.detail_note = QLineEdit(objectName="modNote", maxLength=MAX_MOD_NOTE)
+    window.detail_note.setPlaceholderText("添加个人备注")
+    window.detail_note.setAccessibleName("Mod 备注")
+    window.detail_note.editingFinished.connect(window.save_detail_note)
+    details.addWidget(window.detail_note)
     window.detail_original = label("", "muted")
     window.detail_original.setWordWrap(True)
     window.detail_original.hide()
@@ -435,7 +464,7 @@ def create_details(window):
     description.setSpacing(4)
     description.addWidget(label("简介", "smallCaps"))
     description.addStretch()
-    window.detail_alias_button = button("别名…", lambda: window.edit_mod_text())
+    window.detail_alias_button = button("编辑…", lambda: window.edit_mod_text())
     description.addWidget(window.detail_alias_button)
     details.addLayout(description)
     window.detail_description = QPlainTextEdit()
@@ -471,8 +500,6 @@ class UtilityPane(QFrame):
     def __init__(self, window):
         super().__init__()
         self.setObjectName("panel")
-        self.setMinimumWidth(209)
-        self.setMaximumWidth(390)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 1, 1, 1)
         outer.setSpacing(0)
@@ -522,25 +549,6 @@ class UtilityPane(QFrame):
         self.legacy_group_button.toggled.connect(self.groups.setVisible)
         self.groups.itemActivated.connect(lambda item: window.reveal_entry(item.data(ROLE)))
         self.groups.itemClicked.connect(lambda item: window.reveal_entry(item.data(ROLE)))
-
-        self.stage_page, stage_layout = self.add_page("暂存")
-        self.stage_hint = label("在可用列表选择 Mod 后点「暂存」。", "muted")
-        self.stage_hint.setWordWrap(True)
-        stage_layout.addWidget(self.stage_hint)
-        self.staging = self.add_list(stage_layout, "stagingList", "暂存篮")
-        self.staging.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.staging.itemSelectionChanged.connect(self.update_stage_buttons)
-        self.staging.itemClicked.connect(window.click_staged_item)
-        stage_actions = QHBoxLayout()
-        stage_actions.setSpacing(4)
-        self.stage_activate = button("加入计划", window.add_staged, primary=True)
-        self.stage_activate.setToolTip("将所选项按暂存篮顺序加入计划末尾")
-        self.stage_release = button("移出", window.release_staged)
-        self.stage_release.setToolTip("从暂存篮移出，已安装的 Mod 回到可用列表")
-        self.stage_unlock = button("解锁", lambda: window.unlock_selected(staged=True))
-        for control in (self.stage_activate, self.stage_release, self.stage_unlock):
-            stage_actions.addWidget(control)
-        stage_layout.addLayout(stage_actions)
 
         self.history_page, history_layout = self.add_page("历史")
         self.snapshots = self.add_list(history_layout, "snapshotList", "历史快照")
@@ -610,50 +618,6 @@ class UtilityPane(QFrame):
                 item.setIcon(icon("lock", current_theme().accent))
                 item.setData(ROLE, index)
                 self.groups.addItem(item)
-
-    def set_staged(self, rows, locks):
-        selected = {member for item in self.staging.selectedItems() for member in item.data(ROLE)}
-        scroll = self.staging.verticalScrollBar()
-        scroll_value = scroll.value()
-        name = "暂存"
-        self.tabs.setTabText(self.tabs.indexOf(self.stage_page), f"{name} {len(rows)}" if rows else name)
-        self.stage_hint.setText(
-            "多选后成批加入计划末尾。" if rows else "在可用列表选择 Mod 后点「暂存」。"
-        )
-        with QSignalBlocker(self.staging):
-            self.staging.clear()
-            self.fill_staged(rows, locks, selected)
-            scroll.setValue(scroll_value)
-        self.update_stage_buttons()
-
-    def fill_staged(self, rows, locks, selected):
-        index = 0
-        while index < len(rows):
-            lock = locks.get(index)
-            if lock:
-                chunk = rows[index:index + len(lock.members)]
-                missing = sum(row.mod is None for row in chunk)
-                subtitle = f"联锁 · {len(chunk)} 项" + (f" · {missing} 待匹配" if missing else "")
-                item = QListWidgetItem(f"{lock.title}\n{subtitle}")
-                item.setIcon(icon("lock", current_theme().accent))
-                item.setData(ROLE, lock.members)
-            else:
-                chunk = rows[index:index + 1]
-                row = chunk[0]
-                title = row.mod.name if row.mod else row.entry.name
-                item = QListWidgetItem(f"{title}\n{row.entry.source.label if row.mod else '待匹配'}")
-                item.setData(ROLE, (row.entry.id,))
-            item.setToolTip("\n".join(row.entry.name + (f" · {row.problem}" if row.problem else "") for row in chunk))
-            self.staging.addItem(item)
-            item.setSelected(bool(selected.intersection(item.data(ROLE))))
-            index += len(chunk)
-
-    def update_stage_buttons(self):
-        selected = self.staging.selectedItems()
-        locked = any(len(item.data(ROLE)) > 1 for item in selected)
-        self.stage_activate.setEnabled(bool(selected))
-        self.stage_release.setEnabled(bool(selected) and not locked)
-        self.stage_unlock.setEnabled(locked)
 
     def set_history(self, snapshots):
         self.snapshots.clear()

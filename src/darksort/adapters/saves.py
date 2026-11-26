@@ -168,9 +168,14 @@ def entries_from_slot(state: SaveState, installed: list[Mod]) -> list[ProfileEnt
 
 
 def mods_for_slot(
-    resolved: list[ResolvedEntry], installed: list[Mod], game_roots: list[Path]
+    resolved: list[ResolvedEntry], installed: list[Mod], game_roots: list[Path], *, rules=(),
 ) -> tuple[SavedMod, ...]:
+    from darksort.dependencies import validate_requirements
+    from darksort.file_replacements import deployed_mod_references
+
+    validate_requirements(rules, resolved)
     game_mods = {(root / "mods").resolve() for root in game_roots}
+    deployed = deployed_mod_references(game_roots)
     by_key = {}
     for mod in installed:
         if mod.source == Source.LOCAL and Path(mod.path).parent.resolve() not in game_mods:
@@ -183,6 +188,8 @@ def mods_for_slot(
         mod = row.mod
         if mod is None:
             raise ValueError(f"请先定位 {row.entry.name}。")
+        if mod.reference in deployed:
+            raise ValueError(f"{mod.name} 已通过「游戏文件替换」启用。请先在工具中停用，或从计划中移出。")
         root = Path(mod.path)
         if not root.is_dir():
             raise ValueError(f"{mod.name} 的安装目录已变动，请先重新扫描。")

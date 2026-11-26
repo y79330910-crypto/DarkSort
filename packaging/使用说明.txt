@@ -1,4 +1,4 @@
-DarkSort 0.14.0 · 暗黑地牢 1 Mod 管理器
+DarkSort 0.17.0 · 暗黑地牢 1 Mod 管理器
 
 安装版可从桌面或开始菜单运行。便携版请完整解压 DarkSort 文件夹并保留 _internal，然后运行 DarkSort.exe。
 

@@ -7,17 +7,46 @@ from types import SimpleNamespace
 import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QContextMenuEvent
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QListWidget, QMenu, QToolButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QInputDialog,
+    QListWidget,
+    QMenu,
+    QMessageBox,
+    QToolButton,
+)
 
-from darksort.models import ModGroup, OrderRule, ProfileEntry, ProfileGroup, ScanResult, Source
+from darksort.adapters.dson import SavedMod
+from darksort.adapters.saves import mods_for_slot
+from darksort.models import (
+    ModGroup,
+    OrderRule,
+    ProfileEntry,
+    ProfileGroup,
+    ProfileLock,
+    ScanResult,
+    ScanRoot,
+    Source,
+)
+from darksort.profiles import read_profile_file
 from darksort.save_bindings import SaveBindings
 from darksort.scanning.discovery import Discovery
+from darksort.scanning.metadata import parse_mod
 from darksort.search import ModLocation
 from darksort.settings import DEFAULT_THEME, Settings
+from darksort.ui.ai_dialogs import ModTextDialog
+from darksort.ui.feature_guide import FeatureGuideDialog
+from darksort.ui.file_replacements import FileImportDialog, FilePackDialog
 from darksort.ui.group_panel import ModGroupDialog
+from darksort.ui.local_mods import NewModDialog, WorkshopCopyDialog
 from darksort.ui.main_window import MainWindow
 from darksort.ui.mod_list import ROLE, GroupDragHandle, column_rects
+from darksort.ui.mod_menu import ModMenuDialog
+from darksort.ui.path_dialog import PathDialog
 from darksort.ui.plan_dialogs import HistoryDialog
+from darksort.ui.profile_dialogs import ProfileImportDialog, ProfileManagerDialog
 
 
 def make_window(qtbot, tmp_path, mods):
@@ -123,6 +152,118 @@ def test_switch_profile_and_cancel_unsaved_switch(qtbot, tmp_path, mods, monkeyp
     window.profile_combo.setCurrentIndex(window.profile_combo.findData(first_id))
     assert len(window.profile.entries) == 1
     assert window.profile_list.item(0).data(ROLE)["number"] == 1
+
+
+def test_json_import_previews_named_backups_and_suggests_unique_names(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path / "data", mods)
+    original = window.profile
+    files = [
+        ("无光远征", original.name, mods[0]), ("初代挑战", original.name, mods[1]),
+        ("默认配置", original.name, mods[2]), ("临时备份", "深红庭院", mods[0]),
+    ]
+    paths = [tmp_path / f"{filename}.json" for filename, _, _ in files]
+    for path, (_, title, mod) in zip(paths, files, strict=True):
+        window.store.export_file(replace(original, name=title, entries=[ProfileEntry.from_mod(mod)]), path)
+    imports = iter([*paths, paths[0]])
+    expected = iter([
+        ("无光远征", mods[0]), ("初代挑战", mods[1]), ("默认配置 (2)", mods[2]),
+        ("深红庭院", mods[0]), ("无光远征 (2)", mods[0]),
+    ])
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(next(imports)), ""))
+
+    def confirm(dialog):
+        suggested, mod = next(expected)
+        assert dialog.name.text() == suggested
+        assert "1 个计划 Mod" in dialog.preview.toPlainText() and mod.name in dialog.preview.toPlainText()
+        assert dialog.confirm.isEnabled()
+        if suggested == "无光远征 (2)":
+            dialog.name.setText(" 无光远征 ")
+            assert not dialog.confirm.isEnabled()
+            dialog.name.setText(" 无光布局 ")
+            assert dialog.confirm.isEnabled()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ProfileImportDialog, "exec", confirm)
+    names = ["无光远征", "初代挑战", "默认配置 (2)", "深红庭院", "无光布局"]
+    for name, mod in zip(names, [*mods, mods[0], mods[0]], strict=True):
+        window.import_profile()
+        assert window.profile.name == name and window.resolved[0].mod == mod
+    assert window.store.load(original.id) == original
+    assert {profile.name for profile in window.store.list()[0]} == {*names, original.name}
+    assert len({profile.id for profile in window.store.list()[0]}) == 6
+
+
+def test_profile_manager_disambiguates_existing_duplicates_renames_and_deletes(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path / "data", mods)
+    window.add_keys([mods[0].key])
+    assert window.save_profile()
+    first = window.profile
+    second = window.store.new(first.name, [ProfileEntry.from_mod(mods[1])])
+    snapshot = window.history.capture(first, "改名前")
+    first_slot, second_slot = tmp_path / "profile_0/persist.game.json", tmp_path / "profile_1/persist.game.json"
+    window.save_bindings.set(first_slot, first.id)
+    window.save_bindings.set(second_slot, second.id)
+    window.add_keys([mods[2].key])
+
+    manager = ProfileManagerDialog(window)
+    qtbot.addWidget(manager)
+    manager.show()
+    assert manager.plans.count() == 2 and mods[0].name in manager.preview.toPlainText()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("第一份远征", True))
+    manager.rename.click()
+    assert window.profile.name == "第一份远征" and window.profile.id == first.id
+    assert window.store.load(first.id).entries == first.entries
+    assert window.profile_combo.currentText() == "第一份远征" and window.dirty
+    assert window.save_bindings.get(first_slot) == first.id
+    assert snapshot.id in {saved.id for saved in window.history.list(first.id)[0]}
+    window.undo_stack.undo()
+    assert window.profile.name == "第一份远征" and not window.dirty
+    window.undo_stack.redo()
+    assert window.profile.name == "第一份远征" and window.dirty
+
+    other_row = next(i for i in range(manager.plans.count()) if manager.plans.item(i).data(ROLE).id == second.id)
+    manager.plans.setCurrentRow(other_row)
+    assert mods[1].name in manager.preview.toPlainText() and mods[0].name not in manager.preview.toPlainText()
+    choices = iter([QMessageBox.ButtonRole.RejectRole, QMessageBox.ButtonRole.DestructiveRole])
+
+    def answer(box):
+        assert second.name in box.text() and "解除 1 项档位绑定" in box.text()
+        role = next(choices)
+        next(button for button in box.buttons() if box.buttonRole(button) == role).click()
+
+    monkeypatch.setattr(QMessageBox, "exec", answer)
+    manager.delete.click()
+    assert window.store.load(second.id) == second and window.save_bindings.get(second_slot) == second.id
+    manager.delete.click()
+    assert manager.plans.count() == 1 and window.profile.id == first.id and window.dirty
+    assert window.save_bindings.get(second_slot) is None and window.save_bindings.get(first_slot) == first.id
+    assert not window.store.path(second.id).exists()
+    backup, = (window.data_dir / "deleted-profiles").glob("*.json")
+    assert read_profile_file(backup) == second
+
+
+def test_deleting_final_plan_recovers_from_a_failed_binding_update(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path, mods)
+    original = window.profile
+    target = tmp_path / "saved/persist.game.json"
+    window.save_bindings.set(target, original.id)
+
+    def fail(_mapping):
+        raise OSError("binding file locked")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(window.save_bindings, "write", fail)
+        with pytest.raises(OSError, match="binding file locked"):
+            window.delete_profile(original.id)
+    assert window.store.list()[0] == [original] and window.profile == original
+    assert window.save_bindings.get(target) == original.id
+    assert not list((window.data_dir / "deleted-profiles").glob("*.json"))
+
+    window.delete_profile(original.id)
+    assert window.profile.id != original.id and window.profile.name == "默认配置"
+    assert not window.profile.entries and window.store.list()[0] == [window.profile]
+    assert window.save_bindings.get(target) is None
+    assert Settings.load(window.data_dir).last_profile == window.profile.id
 
 
 def test_keyboard_save_shortcut(qtbot, tmp_path, mods):
@@ -374,15 +515,15 @@ def test_offscreen_relation_indicator_jumps_and_preserves_previous_scroll(qtbot,
     assert not window.selected_profile_indices()
 
 
-def test_global_search_prefers_exact_id_and_reveals_staged_entry(qtbot, tmp_path, mods, monkeypatch):
+def test_global_search_prefers_exact_id_for_grouped_available_mod(qtbot, tmp_path, mods, monkeypatch):
     installed = [mods[0], mods[1], replace(mods[2], description="与 1002 同时使用")]
     window = make_window(qtbot, tmp_path, installed)
     entry = ProfileEntry.from_mod(mods[1])
-    unresolved = ProfileEntry("离线暂存", Source.LOCAL, str(tmp_path / "offline"))
-    window.profile.staged = [entry, unresolved]
+    unresolved = ProfileEntry("离线组员", Source.LOCAL, str(tmp_path / "offline"))
+    group = ModGroup("候选", "#75b9ea", (entry, unresolved))
+    window.profile.mod_groups = [group]
     window.render_lists()
-    window.utility.staging.item(1).setSelected(True)
-    target = ModLocation("staging", entry.id)
+    target = ModLocation("library", mods[1].key)
 
     def choose(dialog):
         dialog.query.setText("１００２")
@@ -399,12 +540,10 @@ def test_global_search_prefers_exact_id_and_reveals_staged_entry(qtbot, tmp_path
     qtbot.waitUntil(lambda: QApplication.focusWidget() is query)
     qtbot.keyClick(query, Qt.Key.Key_F, modifier=Qt.KeyboardModifier.ControlModifier)
     qtbot.waitUntil(lambda: window._detail_target == target)
-    assert window.utility.tabs.currentWidget() == window.utility.stage_page
-    assert window.utility.staging.currentItem().data(ROLE) == (entry.id,)
-    assert window.stage_members() == {unresolved.id}
+    assert window.library_list.currentItem().data(ROLE)["value"] == mods[1].key
     assert window.detail_title.text() == entry.name
     assert not window.profile.entries
-    assert window.profile.staged == [entry, unresolved]
+    assert window.profile.mod_groups == [group]
 
     opened, copied = [], []
     monkeypatch.setattr("darksort.ui.workshop.steam_protocol_registered", lambda: False)
@@ -445,23 +584,24 @@ def test_ambiguous_relation_lists_distinct_install_candidates(qtbot, tmp_path, m
     assert window._relation_anchor == ModLocation("library", skin.key)
 
 
-def test_association_to_staging_keeps_return_available(qtbot, tmp_path, mods):
+def test_association_to_unmatched_group_member_keeps_return_available(qtbot, tmp_path, mods):
     window = make_window(qtbot, tmp_path, mods)
     window.add_keys([mods[0].key])
     source = window.profile.entries[0]
-    staged = ProfileEntry.from_mod(mods[1])
-    window.profile.staged.append(staged)
-    window.profile.rules.append(OrderRule(source.reference, staged.reference, "requires"))
+    member = ProfileEntry("离线前置", Source.LOCAL, str(tmp_path / "missing"))
+    group = ModGroup("候选", "#75b9ea", (member,))
+    window.profile.mod_groups.append(group)
+    window.profile.rules.append(OrderRule(source.reference, member.reference, "requires"))
     window.render_lists()
     window.navigate(ModLocation("profile", source.id))
     relation = window.utility.relations.item(0).data(ROLE)
-    assert relation.location == "暂存篮"
+    assert relation.location == "分组 · 候选"
 
     window.reveal_relation(relation)
-    assert window.utility.tabs.currentWidget() == window.utility.stage_page
+    assert window.utility.tabs.currentWidget() == window.utility.groups_page
     assert window.utility.relation_navigation.isVisible()
-    assert not window.stage_members()
-    assert window.detail_title.text() == staged.name
+    assert window.utility.group_shelf.tree.currentItem().data(0, ROLE).entry == member
+    assert window.detail_title.text() == member.name
     window.return_to_relation_origin()
     assert window.utility.tabs.currentWidget() == window.utility.relation_page
     assert not window.utility.relation_navigation.isVisible()
@@ -506,31 +646,52 @@ def test_lock_moves_as_a_unit_and_can_be_disabled_and_enabled(qtbot, tmp_path, m
 
     window.remove_selected()
     assert window.profile.entries == [b]
-    assert window.profile.staged == [a, c]
-    assert window.utility.staging.count() == 1
-    assert window.utility.stage_activate.isEnabled()
+    group, = window.profile.mod_groups
+    assert group.locked and group.members == (a, c)
+    assert window.utility.tabs.currentWidget() == window.utility.groups_page
     window.save_profile()
-    assert window.store.load(window.profile.id).locks[0].members == (a.id, c.id)
-    window.add_staged()
-    assert not window.profile.staged
+    assert window.store.load(window.profile.id).mod_groups == [group]
+    window.apply_mod_group(group.id, "profile")
     assert window.profile.entries == [b, a, c]
     assert window.profile.locks[0].members == (a.id, c.id)
 
 
-def open_mod_context(qtbot, view, row):
-    point = view.visualItemRect(view.item(row)).center()
-    qtbot.mouseClick(view.viewport(), Qt.MouseButton.RightButton, pos=point)
-    menu = view.findChild(QMenu, "modContextMenu")
-    if menu is None or not menu.isVisible():
-        event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, view.viewport().mapToGlobal(point))
-        QApplication.sendEvent(view.viewport(), event)
-        menu = view.findChild(QMenu, "modContextMenu")
-    assert menu is not None and menu.isVisible()
+def visible_mod_menu(view, mode=None):
+    return next((menu for menu in view.findChildren(QMenu, "modContextMenu")
+                 if menu.isVisible() and (mode is None or menu.property("menuMode") == mode)), None)
+
+
+def switch_mod_menu(qtbot, view, menu, mode):
+    if mode is not None and menu.property("menuMode") != mode:
+        action = menu_action(menu, "显示详细选项" if mode == "full" else "返回常用选项")
+        qtbot.mouseClick(menu, Qt.MouseButton.LeftButton, pos=menu.actionGeometry(action).center())
+        qtbot.waitUntil(lambda: visible_mod_menu(view, mode) is not None)
+        return visible_mod_menu(view, mode)
     return menu
 
 
+def open_mod_context(qtbot, view, row, *, mode="full"):
+    point = view.visualItemRect(view.item(row)).center()
+    qtbot.mouseClick(view.viewport(), Qt.MouseButton.RightButton, pos=point)
+    menu = visible_mod_menu(view)
+    if menu is None:
+        event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, view.viewport().mapToGlobal(point))
+        QApplication.sendEvent(view.viewport(), event)
+        menu = visible_mod_menu(view)
+    assert menu is not None and menu.isVisible()
+    return switch_mod_menu(qtbot, view, menu, mode)
+
+
 def menu_action(menu, text):
-    return next(action for action in menu.actions() if action.text() == text)
+    for action in menu.actions():
+        if action.text() == text:
+            return action
+        if action.menu():
+            try:
+                return menu_action(action.menu(), text)
+            except LookupError:
+                continue
+    raise LookupError(text)
 
 
 def test_plan_context_adds_rule_using_exact_target_search(qtbot, tmp_path, mods, monkeypatch):
@@ -661,7 +822,9 @@ def test_linked_mod_folder_and_metadata_actions_follow_clicked_row(qtbot, tmp_pa
     assert [Path(path) for path in opened] == [Path(mods[1].path), Path(mods[0].path)]
     assert tagged == [mods[0]]
     window.remove_selected()
-    assert [row.mod for row in window.staged_resolved] == mods[:2]
+    assert [member.reference for member in window.profile.mod_groups[0].members] == [
+        mod.reference for mod in mods[:2]
+    ]
 
 
 def test_undo_redo_restores_full_link_and_tracks_saved_state(qtbot, tmp_path, mods):
@@ -678,7 +841,7 @@ def test_undo_redo_restores_full_link_and_tracks_saved_state(qtbot, tmp_path, mo
     initial = [entry.id for entry in window.profile.entries]
     lock, = window.profile.locks
     window.remove_indices([1])
-    assert [entry.id for entry in window.profile.staged] == initial[:2]
+    assert [entry.id for entry in window.profile.mod_groups[0].members] == initial[:2]
     assert window.save_profile() and not window.dirty
 
     qtbot.waitExposed(window)
@@ -688,9 +851,9 @@ def test_undo_redo_restores_full_link_and_tracks_saved_state(qtbot, tmp_path, mo
     qtbot.waitUntil(lambda: window.isActiveWindow() and view.hasFocus())
     qtbot.keyClick(view, Qt.Key.Key_Z, modifier=Qt.KeyboardModifier.ControlModifier)
     assert window.dirty and [entry.id for entry in window.profile.entries] == initial
-    assert not window.profile.staged and window.profile.locks == [lock]
+    assert not window.profile.mod_groups and window.profile.locks == [lock]
     qtbot.keyClick(view, Qt.Key.Key_Z, modifier=Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
-    assert not window.dirty and [entry.id for entry in window.profile.staged] == initial[:2]
+    assert not window.dirty and [entry.id for entry in window.profile.mod_groups[0].members] == initial[:2]
     qtbot.keyClick(view, Qt.Key.Key_Z, modifier=Qt.KeyboardModifier.ControlModifier)
     qtbot.keyClick(view, Qt.Key.Key_Y, modifier=Qt.KeyboardModifier.ControlModifier)
     assert not window.dirty
@@ -712,16 +875,20 @@ def test_share_preview_creates_independent_plan_and_keeps_unmatched_row(qtbot, t
     assert path.is_file() and window.dirty
     previews = []
 
-    def confirm(_parent, _title, summary, _action):
-        previews.append(summary)
-        return len(previews) == 2
+    def confirm(dialog):
+        assert dialog.name.text() == "分享"
+        previews.append(dialog.preview.toPlainText())
+        if len(previews) == 1:
+            return QDialog.DialogCode.Rejected
+        dialog.name.setText("远征分享")
+        return QDialog.DialogCode.Accepted
 
-    monkeypatch.setattr("darksort.ui.main_window.confirmation_dialog", confirm)
+    monkeypatch.setattr(ProfileImportDialog, "exec", confirm)
     monkeypatch.setattr(window, "maybe_save", lambda: True)
     window.import_share_package()
     assert window.profile.id == source_id and len(window.store.list()[0]) == 1
     window.import_share_package()
-    assert window.profile.id != source_id and not window.dirty
+    assert window.profile.id != source_id and window.profile.name == "远征分享" and not window.dirty
     assert "1 已匹配 · 1 待匹配" in previews[0]
     assert [row.mod for row in window.resolved] == [None, mods[0]]
     assert window.store.load(source_id).entries == []
@@ -746,7 +913,7 @@ def test_load_and_match_group_template_as_undoable_draft(qtbot, tmp_path, mods, 
     window.redo_action.trigger()
     assert window.profile.mod_groups == [imported] and window.dirty
     monkeypatch.setattr(window, "choose_installed_mod", lambda _: mods[2])
-    window.relink_group_member(imported.id, imported.members[0].reference)
+    window.relink_group_member(imported.id, imported.members[0].id)
     window.apply_mod_group(imported.id, "profile")
     assert [row.mod for row in window.resolved] == [mods[2], mods[1]]
 
@@ -779,6 +946,130 @@ def test_workshop_button_falls_back_and_unmatched_mod_has_browser_and_copy_actio
     menu_action(menu, "复制工坊链接").trigger()
     menu.hide()
     assert opened[-2:] == [client, website] and copied == [website]
+
+
+def test_local_workshop_association_persists_and_keeps_native_plan_and_save_identity(qtbot, tmp_path, monkeypatch):
+    game = tmp_path / "game"
+    folder = game / "mods" / "local"
+    folder.mkdir(parents=True)
+    xml = folder / "project.xml"
+    original = b"<project><Title>Local title</Title></project>"
+    xml.write_bytes(original)
+    local = parse_mod(folder, Source.LOCAL)
+    workshop = replace(local, source=Source.WORKSHOP, path=str(tmp_path / "123456"), workshop_id="123456")
+    window = make_window(qtbot, tmp_path / "data", [local, workshop])
+    window.add_keys([local.key])
+    window.save_profile()
+    saved = window.store.load(window.profile.id).entries[0]
+    url = "https://steamcommunity.com/sharedfiles/filedetails/?id=123456"
+    inputs = iter([(url + "&searchtext=test", True), ("654321", True), ("", True)])
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: next(inputs))
+    menu = open_mod_context(qtbot, window.profile_list, 0)
+    menu_action(menu, "关联创意工坊…").trigger()
+    menu.hide()
+
+    assert Settings.load(window.data_dir).mod_workshop_links == {local.reference: "123456"}
+    assert window.search_records["profile"][0].rank("123456") == 0
+    assert window.workshop_button.isVisible() and window._detail_workshop_id == "123456"
+    assert window.store.load(window.profile.id).entries[0] == saved
+    assert saved.source == Source.LOCAL and saved.workshop_id is None and not window.dirty
+    assert window.resolved[0].mod == local and xml.read_bytes() == original
+    assert mods_for_slot(window.resolved, window.mods, [game]) == (SavedMod("Local title", "mod_local_source"),)
+
+    opened = []
+    monkeypatch.setattr("darksort.ui.main_window.open_workshop_page", lambda identifier, **_: opened.append(identifier) or "Steam")
+    window.workshop_button.click()
+    assert opened == ["123456"]
+    window.associate_workshop(local)
+    assert window.workshop_identifier(local) == "654321"
+    assert window.workshop_identifier(workshop) == "123456"
+    window.associate_workshop(local)
+    assert Settings.load(window.data_dir).mod_workshop_links == {}
+    assert not window.workshop_identifier(local)
+
+
+def test_scan_exclusion_context_menu_and_restore_repopulate_library(qtbot, tmp_path, monkeypatch):
+    root = tmp_path / "mods"
+    ignored = root / "DD Mod Lib"
+    legacy = root / "old_mod"
+    for folder in (ignored, legacy):
+        folder.mkdir(parents=True)
+    installed = [parse_mod(path, Source.LOCAL) for path in (ignored, legacy)]
+    window = make_window(qtbot, tmp_path / "data", installed)
+    window.settings = Settings(auto_detect=False, local_paths=[str(root)])
+    view = window.library_list
+    row = next(row for row in range(view.count()) if view.item(row).data(ROLE)["value"] == installed[0].key)
+    menu = open_mod_context(qtbot, view, row)
+    menu_action(menu, "从扫描中排除").trigger()
+    menu.hide()
+    qtbot.waitUntil(lambda: window.worker is None and window.available_keys == {installed[1].key}, timeout=4000)
+    assert Settings.load(window.data_dir).excluded_paths == [str(ignored)]
+    assert ignored.is_dir()
+
+    def restore(dialog):
+        assert dialog.excluded.item(0).text() == str(ignored)
+        dialog.excluded.item(0).setSelected(True)
+        dialog.restore_exclusions()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(PathDialog, "exec", restore)
+    window.edit_paths()
+    qtbot.waitUntil(lambda: window.worker is None and len(window.available_keys) == 2, timeout=4000)
+    assert not Settings.load(window.data_dir).excluded_paths
+
+
+def test_workshop_resource_transfer_hides_source_and_updates_without_losing_current_plan(qtbot, tmp_path, mods, monkeypatch):
+    original = mods[0]
+    root = Path(original.path) / "fe_flow"
+    root.mkdir(parents=True)
+    source = root / "title_bg.png"
+    source.write_bytes(b"workshop title")
+    game = tmp_path / "game"
+    executable = game / "_windows/win64/Darkest.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"test only")
+    window = make_window(qtbot, tmp_path / "data", mods)
+    window.discovery = Discovery(games=[game])
+    window.add_keys([original.key, mods[1].key])
+    first, second = window.profile.entries
+    window.profile.groups = [ProfileGroup(first.id, "保留标题")]
+    window.profile.locks = [ProfileLock("有源条目", (first.id, second.id))]
+    window.render_lists()
+    other = window.store.new("另一个方案", [ProfileEntry.from_mod(original)])
+    window.save_profile()
+    dialog = FilePackDialog(window)
+    qtbot.addWidget(dialog)
+    previews = []
+
+    def approve(preview):
+        previews.append(preview.rows)
+        assert preview.confirm.isEnabled()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(FileImportDialog, "exec", approve)
+    dialog.import_mod(original)
+    pack = dialog.selected()
+    assert pack.origin.workshop_id == "1001"
+    assert previews == [(("fe_flow/title_bg.png", "新增"),)]
+    assert window.profile.entries == [second] and not window.profile.locks
+    assert window.profile.groups == [ProfileGroup(second.id, "保留标题")]
+    assert window.store.load(other.id).entries[0].reference == original.reference
+    assert original.key in window.mods_by_key and original.key not in window.available_keys
+    assert not (game / "fe_flow/title_bg.png").exists() and source.read_bytes() == b"workshop title"
+    window.undo_stack.undo()
+    assert window.profile.entries == [first, second]
+    window.undo_stack.redo()
+
+    source.write_bytes(b"workshop title updated")
+    dialog.check_updates()
+    assert "有更新" in dialog.list.currentItem().text()
+    dialog.update_pack()
+    assert dialog.selected().revision != pack.revision
+    assert "有更新" not in dialog.list.currentItem().text()
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Yes)
+    dialog.remove_pack()
+    assert window.file_packs.list() == ([], [])
+    assert original.key in window.available_keys and source.read_bytes() == b"workshop title updated"
 
 
 def test_saved_group_can_be_dragged_and_toggled_and_marks_shared_members(qtbot, tmp_path, mods, monkeypatch):
@@ -1093,25 +1384,366 @@ def test_uncertain_path_stays_out_of_yellow_and_ignore_follows_change_in_winner(
     assert "乙 Mod" in panel.message.text()
 
 
-def test_staging_candidates_is_per_profile_and_does_not_activate(qtbot, tmp_path, mods):
+def test_grouping_candidates_is_per_profile_and_does_not_activate(qtbot, tmp_path, mods):
     window = make_window(qtbot, tmp_path, mods)
-    window.library_list.item(0).setSelected(True)
-    window.library_list.item(1).setSelected(True)
-    window.stage_available()
-    assert not window.profile.entries
-    assert len(window.profile.staged) == 2
-    assert window.library_list.count() == 1
-    assert window.utility.staging.count() == 2
-    window.add_staged()
-    assert len(window.profile.entries) == 2 and not window.profile.staged
-    window.profile_list.clearSelection()
-    window.profile_list.item(0).setSelected(True)
-    window.stage_plan()
+    group = ModGroup("候选", "#75b9ea", tuple(ProfileEntry.from_mod(mod) for mod in mods[:2]))
+    assert window.save_mod_group(group)
+    assert not window.profile.entries and window.library_list.count() == 3
+    assert all("暂存" not in window.utility.tabs.tabText(i) for i in range(window.utility.tabs.count()))
+    window.apply_mod_group(group.id, "profile")
+    assert len(window.profile.entries) == 2
+    window.remove_indices([0])
     window.save_profile()
     previous = window.profile.id
     window.activate_profile(window.store.new("其它方案"))
-    assert not window.profile.staged and window.library_list.count() == 3
-    assert len(window.store.load(previous).staged) == 1
+    assert not window.profile.mod_groups and window.library_list.count() == 3
+    assert window.store.load(previous).mod_groups == [group]
+
+
+def test_group_member_menu_and_drag_inside_group_and_into_plan(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path, mods)
+    members = tuple(ProfileEntry.from_mod(mod) for mod in mods)
+    group = ModGroup("皮肤预设", "#75b9ea", members)
+    window.save_mod_group(group)
+    window.show_utility_page(window.utility.groups_page)
+    tree = window.utility.group_shelf.tree
+    root = tree.topLevelItem(0)
+    tree.setCurrentItem(root.child(0))
+    window.utility.group_shelf.member_menu(tree.visualItemRect(root.child(0)).center())
+    menu = switch_mod_menu(qtbot, tree, visible_mod_menu(tree), "full")
+    assert menu_action(menu, "编辑别名、简介与备注…").isEnabled()
+    assert menu_action(menu, "设置前置…").isEnabled()
+    assert menu_action(menu, "打开创意工坊").isEnabled()
+    menu.hide()
+
+    landed = []
+    destination = tree
+
+    class Drag:
+        def __init__(self, source):
+            self.source = source
+
+        def setMimeData(self, mime):
+            self.mime = mime
+
+        def setPixmap(self, _):
+            pass
+
+        def exec(self, _):
+            position = (tree.visualItemRect(tree.topLevelItem(0).child(2)).bottomLeft()
+                        if destination is tree else QPoint(5, 5))
+            destination.dropEvent(SimpleNamespace(
+                source=lambda: self.source, mimeData=lambda: self.mime, position=lambda: QPointF(position),
+                acceptProposedAction=lambda: landed.append(True), ignore=lambda: landed.append(False),
+            ))
+
+    monkeypatch.setattr("darksort.ui.mod_list.QDrag", Drag)
+    tree.startDrag(Qt.DropAction.MoveAction)
+    qtbot.waitUntil(lambda: window.profile.mod_groups[0].members[0] == members[1])
+    assert window.profile.mod_groups[0].members == (members[1], members[2], members[0])
+    assert not window.profile.entries
+    window.undo_stack.undo()
+    assert window.profile.mod_groups == [group]
+
+    destination = window.profile_list
+    tree.setCurrentItem(tree.topLevelItem(0).child(1))
+    tree.startDrag(Qt.DropAction.MoveAction)
+    qtbot.waitUntil(lambda: bool(window.profile.entries))
+    assert landed == [True, True] and window.resolved[0].mod == mods[1]
+
+
+def test_four_workbench_panes_can_collapse_and_restore_widths(qtbot, tmp_path, mods):
+    window = make_window(qtbot, tmp_path, mods)
+    split = window.panes
+    normal = split.sizes()
+    window.resize(1030, 650)
+    for index in range(split.count()):
+        split.setSizes(normal)
+        window.toggle_pane(split.widget(index))
+        assert split.sizes()[index] == 0
+        window.toggle_pane(split.widget(index))
+        assert split.sizes()[index] > 0
+    split.setSizes([0, 110, 275, 620])
+    assert split.sizes()[0] == 0 and split.sizes()[3] > 390
+    window.close()
+    saved = Settings.load(tmp_path)
+    assert saved.pane_sizes[0] == 0 and saved.pane_sizes[3] > 390
+    reopened = make_window(qtbot, tmp_path, mods)
+    assert reopened.panes.sizes()[0] == 0 and reopened.panes.sizes()[3] > 390
+
+
+def test_detail_note_and_double_click_dialog_store_the_same_local_note(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path, mods)
+    mod = mods[0]
+    window.navigate(ModLocation("library", mod.key))
+    window.detail_note.setText("从小框记录")
+    window.detail_note.editingFinished.emit()
+    assert Settings.load(tmp_path).mod_notes == {mod.reference: "从小框记录"}
+
+    def edit(dialog):
+        assert dialog.note.text() == "从小框记录"
+        dialog.alias.setText("显示名称")
+        dialog.translation.setPlainText("重新写的简介")
+        dialog.note.setText("从窗口改的备注")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ModTextDialog, "exec", edit)
+    qtbot.mouseDClick(window.detail_title, Qt.MouseButton.LeftButton)
+    assert window.detail_title.text() == "显示名称"
+    assert window.detail_description.toPlainText() == "重新写的简介"
+    assert window.detail_note.text() == "从窗口改的备注"
+    window.activate_profile(window.store.new("另一份方案"))
+    window.navigate(ModLocation("library", mod.key))
+    assert window.detail_note.text() == "从窗口改的备注"
+    assert Settings.load(tmp_path).mod_notes[mod.reference] == "从窗口改的备注"
+
+
+def test_prerequisites_apply_as_one_edit_and_guard_removal(qtbot, tmp_path, mods):
+    window = make_window(qtbot, tmp_path, mods)
+    a, b, c = mods
+    group = ModGroup("候选补丁", "#75b9ea", (ProfileEntry.from_mod(a),))
+    window.save_mod_group(group)
+    window.profile.rules = [OrderRule(a.reference, b.reference, "requires"),
+                            OrderRule(b.reference, c.reference, "requires")]
+    window.render_lists()
+    window.apply_mod_group(group.id, "profile")
+    assert [row.mod for row in window.resolved] == mods
+    window.undo_stack.undo()
+    assert not window.profile.entries
+    window.undo_stack.redo()
+    assert not window.remove_indices([1])
+    assert "仍需要" in window.statusBar().currentMessage()
+    assert window.remove_indices([0])
+    assert [row.mod for row in window.resolved] == mods[1:]
+    assert window.remove_indices([0, 1])
+    window.profile.rules.append(OrderRule(c.reference, a.reference, "requires"))
+    window.add_keys([a.key])
+    assert not window.profile.entries and "循环" in window.statusBar().currentMessage()
+    window.profile.rules.pop()
+    window.file_tool_keys = {c.key}
+    window.add_keys([a.key])
+    assert not window.profile.entries and "无法启用前置" in window.statusBar().currentMessage()
+
+
+def test_tools_create_copy_and_uninstall_from_the_normal_menus(qtbot, tmp_path, monkeypatch):
+    game = tmp_path / "game"
+    executable = game / "_windows/win64/Darkest.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"test")
+    source = tmp_path / "workshop/456"
+    (source / "heroes").mkdir(parents=True)
+    (source / "heroes/change.darkest").write_bytes(b"mod data")
+    original = b"<project><Title>Workshop Mod</Title></project>"
+    (source / "project.xml").write_bytes(original)
+    workshop = parse_mod(source, Source.WORKSHOP)
+    window = make_window(qtbot, tmp_path / "data", [workshop])
+    roots = [ScanRoot(game / "mods", Source.LOCAL), ScanRoot(source.parent, Source.WORKSHOP)]
+    window.discovery = Discovery(games=[game], roots=roots)
+    window.settings = Settings(auto_detect=False, game_path=str(game), workshop_paths=[str(source.parent)])
+    tools = next(action.menu() for action in window.menuBar().actions() if action.text() == "工具")
+
+    opened = []
+    monkeypatch.setattr("darksort.ui.main_window.QDesktopServices.openUrl",
+                        lambda url: opened.append(Path(url.toLocalFile())) or True)
+
+    def new(dialog):
+        dialog.title.setText("我的空模组")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(NewModDialog, "exec", new)
+    menu_action(tools, "新建空模组…").trigger()
+    qtbot.waitUntil(lambda: window.worker is None)
+    blank, = opened
+    assert blank.parent == game / "mods" and (blank / "project.xml").is_file()
+    local = parse_mod(blank, Source.LOCAL)
+
+    window.add_keys([workshop.key, local.key])
+    upstream, dependency = window.profile.entries
+    window.profile.locks = [ProfileLock("配套", (upstream.id, dependency.id))]
+    window.profile.rules = [OrderRule(upstream.reference, dependency.reference, "requires")]
+    window.render_lists()
+    window.navigate(ModLocation("profile", upstream.id))
+    monkeypatch.setattr(WorkshopCopyDialog, "exec", lambda _: QDialog.DialogCode.Accepted)
+    menu_action(tools, "工坊 Mod 转为本地…").trigger()
+    qtbot.waitUntil(lambda: window.worker is None)
+    converted = window.resolved[0].mod
+    assert converted and converted.source == Source.LOCAL and converted.workshop_id == "456"
+    assert Path(converted.path, "heroes", "change.darkest").read_bytes() == b"mod data"
+    assert (source / "project.xml").read_bytes() == original
+    assert window.profile.entries[0].id == upstream.id
+    assert window.profile.locks[0].members == (upstream.id, dependency.id)
+    assert window.profile.rules[0].first == converted.reference
+
+    confirmations = []
+    trash = tmp_path / "trash"
+    trash.mkdir()
+
+    class TrashFile:
+        def __init__(self, file):
+            self.path = Path(file)
+
+        def moveToTrash(self):
+            self.path.rename(trash / self.path.name)
+            return True
+
+    monkeypatch.setattr("darksort.ui.main_window.QFile", TrashFile)
+    monkeypatch.setattr("darksort.ui.main_window.require_game_stopped", lambda: None)
+    monkeypatch.setattr("darksort.ui.main_window.confirmation_dialog",
+                        lambda _, title, detail, button: confirmations.append((title, detail, button)) or True)
+    menu = open_mod_context(qtbot, window.profile_list, 0)
+    menu_action(menu, "卸载本地 Mod…").trigger()
+    menu.hide()
+    qtbot.waitUntil(lambda: window.worker is None)
+    assert window.resolved[0].mod is None and window.resolved[0].entry.id == upstream.id
+    assert not Path(converted.path).exists() and (trash / Path(converted.path).name).is_dir()
+    assert window.profile.name in confirmations[0][1] and source.is_dir()
+
+
+def test_context_menu_switch_and_custom_items_are_applied_per_list(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path, mods)
+    view = window.library_list
+    row = next(i for i in range(view.count()) if view.item(i).data(ROLE)["value"] == mods[0].key)
+    menu = open_mod_context(qtbot, view, row, mode=None)
+    assert menu.property("menuMode") == "full"
+    assert menu_action(menu_action(menu, "文件与扫描").menu(), "从扫描中排除").isEnabled()
+    assert menu_action(menu_action(menu, "计划与分组").menu(), "设置前置…").isEnabled()
+    assert menu_action(menu_action(menu, "创意工坊").menu(), "在 Steam 取消订阅…").isEnabled()
+    menu.setActiveAction(menu_action(menu, "返回常用选项"))
+    qtbot.keyClick(menu, Qt.Key.Key_Return)
+    qtbot.waitUntil(lambda: visible_mod_menu(view, "quick") is not None)
+    menu = visible_mod_menu(view, "quick")
+    assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
+        "加入计划", "分组管理", "编辑别名、简介与备注…", "打开 Mod 文件夹", "打开创意工坊", "显示详细选项",
+    ]
+    assert window.settings.mod_menu_mode == "full"
+    menu = switch_mod_menu(qtbot, view, menu, "full")
+    menu.hide()
+
+    def customize(dialog):
+        dialog.mode.setCurrentIndex(dialog.mode.findData("quick"))
+        assert dialog.tabs.currentWidget() is dialog.lists["library"]
+        presets = {"library": ("exclude", "add"), "profile": ("requires",), "group": ("locate",)}
+        for side, keys in presets.items():
+            choices = dialog.lists[side]
+            for index in range(choices.count()):
+                item = choices.item(index)
+                checked = item.data(ROLE) in keys
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            for destination, key in enumerate(keys):
+                index = next(i for i in range(choices.count()) if choices.item(i).data(ROLE) == key)
+                choices.insertItem(destination, choices.takeItem(index))
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ModMenuDialog, "exec", customize)
+    view_menu = next(action.menu() for action in window.menuBar().actions() if action.text() == "视图")
+    menu_action(view_menu, "右键菜单设置…").trigger()
+    saved = Settings.load(tmp_path)
+    assert saved.mod_menu_mode == "quick"
+    assert saved.mod_menu_items == {"library": ["exclude", "add"], "profile": ["requires"], "group": ["locate"]}
+    qtbot.waitUntil(lambda: not visible_mod_menu(view))
+    menu = open_mod_context(qtbot, view, row, mode=None)
+    assert menu.property("menuMode") == "quick"
+    assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
+        "从扫描中排除", "加入计划", "显示详细选项",
+    ]
+    menu.hide()
+    window.add_keys([mods[0].key])
+    menu = open_mod_context(qtbot, window.profile_list, 0, mode="quick")
+    assert [action.text() for action in menu.actions() if not action.isSeparator()] == [
+        "设置前置…", "显示详细选项",
+    ]
+    menu.hide()
+
+
+def test_previous_implicit_quick_menu_upgrades_to_detailed(tmp_path):
+    Settings(mod_menu_mode="quick").save(tmp_path)
+    assert Settings.load(tmp_path).mod_menu_mode == "full"
+    Settings(mod_menu_mode="quick", mod_menu_items={"library": []}).save(tmp_path)
+    assert Settings.load(tmp_path).mod_menu_mode == "quick"
+
+
+def test_library_context_can_join_as_lock_or_under_heading_in_one_edit(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path, mods)
+    first, second, required = mods
+    window.profile.rules = [OrderRule(first.reference, required.reference, "requires")]
+    window.render_lists()
+    view = window.library_list
+    positions = {view.item(i).data(ROLE)["value"]: i for i in range(view.count())}
+    view.clearSelection()
+    for mod in (first, second):
+        view.item(positions[mod.key]).setSelected(True)
+    start = window.undo_stack.count()
+    menu = open_mod_context(qtbot, view, positions[first.key])
+    menu_action(menu, "加入计划并联锁").trigger()
+    menu.hide()
+    assert window.undo_stack.count() == start + 1
+    assert {row.mod for row in window.resolved[:2]} == {first, second} and window.resolved[-1].mod == required
+    assert window.profile.locks[0].members == tuple(entry.id for entry in window.profile.entries[:2])
+    window.undo_stack.undo()
+    assert not window.profile.entries and not window.profile.locks
+
+    view.clearSelection()
+    qtbot.waitUntil(lambda: not visible_mod_menu(view))
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kw: ("预设标题", True))
+    menu = open_mod_context(qtbot, view, positions[first.key])
+    menu_action(menu, "加入计划并设标题…").trigger()
+    menu.hide()
+    assert [row.mod for row in window.resolved] == [first, required]
+    assert window.profile.groups == [ProfileGroup(window.profile.entries[0].id, "预设标题")]
+
+
+def test_library_context_can_locate_grouped_mod_and_match_pending_entry(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path, mods)
+    picked, active, _ = mods
+    pending = ProfileEntry("待匹配测试", Source.LOCAL, "")
+    entry = ProfileEntry.from_mod(active)
+    window.profile.entries = [pending, entry]
+    window.profile.rules = [OrderRule(pending.reference, entry.reference)]
+    group = ModGroup("已有分组", "#75b9ea", (ProfileEntry.from_mod(picked),))
+    window.profile.mod_groups = [group]
+    window.render_lists()
+    view = window.library_list
+    index = next(i for i in range(view.count()) if view.item(i).data(ROLE)["value"] == picked.key)
+
+    menu = open_mod_context(qtbot, view, index)
+    sub = menu_action(menu_action(menu, "分组管理").menu(), "在分组中定位").menu()
+    assert menu_action(sub, group.title)
+    menu_action(sub, group.title).trigger()
+    assert window.utility.tabs.currentWidget() == window.utility.groups_page
+    assert window.utility.group_shelf.tree.currentItem().data(0, ROLE).entry.id == group.members[0].id
+
+    def match(picker):
+        assert {record.target.identity for record in picker.records} == {pending.id}
+        picker.choose(picker.results.item(0))
+        return picker.result()
+
+    monkeypatch.setattr("darksort.ui.main_window.GlobalSearchDialog.exec", match)
+    menu_action(menu, "匹配待定位条目…").trigger()
+    menu.hide()
+    assert window.resolved[0].mod == picked and window.profile.entries[0].id == pending.id
+    assert window.profile.rules[0].first == picked.reference
+
+
+def test_help_menu_opens_searchable_feature_guide(qtbot, tmp_path, mods, monkeypatch):
+    window = make_window(qtbot, tmp_path, mods)
+    opened = []
+
+    def inspect(dialog):
+        opened.append(dialog.windowTitle())
+        assert dialog.tree.topLevelItemCount() == 6
+        dialog.query.setText("回收站")
+        assert "卸载本地 Mod" in dialog.path.text()
+        assert "Windows 回收站" in dialog.description.text()
+        dialog.query.setText("右键菜单设置")
+        assert dialog.path.text() == "视图 → 右键菜单设置…"
+        dialog.query.setText("找不到的功能样例")
+        assert dialog.tree.topLevelItemCount() == 0 and not dialog.path.text()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(FeatureGuideDialog, "exec", inspect)
+    help_menu = next(action.menu() for action in window.menuBar().actions() if action.text() == "帮助")
+    menu_action(help_menu, "功能与入口…").trigger()
+    assert opened == ["功能与入口"]
 
 
 def test_main_window_reopens_the_same_slot_after_switching_to_bound_profile(

@@ -7,6 +7,7 @@ from darksort.storage import atomic_json, read_json
 
 DEFAULT_THEME = "nightfall"
 MAX_SETTINGS_BYTES = 64 * 1024 * 1024
+MAX_MOD_NOTE = 500
 MARK_COLORS = (
     ("蓝色", "#75b9ea"),
     ("紫色", "#bd99e8"),
@@ -33,6 +34,13 @@ class Settings:
     mod_aliases: dict[str, str] = field(default_factory=dict)
     mod_translations: dict[str, str] = field(default_factory=dict)
     ignored_problems: dict[str, list[str]] = field(default_factory=dict)
+    excluded_paths: list[str] = field(default_factory=list)
+    mod_workshop_links: dict[str, str] = field(default_factory=dict)
+    mod_notes: dict[str, str] = field(default_factory=dict)
+    pane_sizes: list[int] = field(default_factory=list)
+    mod_menu_mode: str = "full"
+    mod_menu_items: dict[str, list[str]] = field(default_factory=dict)
+    campaign_launch_options: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, data_dir: Path) -> Settings:
@@ -43,16 +51,42 @@ class Settings:
         for key in ("game_path", "last_profile", "theme"):
             if key in data and not isinstance(data[key], str):
                 raise ValueError(f"设置字段 {key} 无效。")
-        for key in ("steam_paths", "workshop_paths", "local_paths"):
+        for key in ("steam_paths", "workshop_paths", "local_paths", "excluded_paths"):
             value = data.get(key, [])
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise ValueError(f"设置字段 {key} 无效。")
         if "auto_detect" in data and not isinstance(data["auto_detect"], bool):
             raise ValueError("自动检测设置无效。")
-        for key in ("mod_categories", "mod_colors", "mod_aliases", "mod_translations"):
+        for key in ("mod_categories", "mod_colors", "mod_aliases", "mod_translations",
+                    "mod_workshop_links", "mod_notes"):
             values = data.get(key, {})
             if not isinstance(values, dict) or not all(isinstance(value, str) for value in values.values()):
                 raise ValueError(f"设置字段 {key} 无效。")
+        sizes = data.get("pane_sizes", [])
+        if not isinstance(sizes, list) or (sizes and (
+            len(sizes) != 4 or not all(type(size) is int and 0 <= size <= 32767 for size in sizes)
+            or not any(sizes)
+        )):
+            raise ValueError("栏宽设置无效。")
+        if data.get("mod_menu_mode") not in ("quick", "full"):
+            data.pop("mod_menu_mode", None)
+        menu_items = data.get("mod_menu_items", {})
+        data["mod_menu_items"] = {
+            side: list(dict.fromkeys(items))
+            for side, items in menu_items.items()
+            if side in ("library", "profile", "group") and isinstance(items, list)
+            and all(isinstance(item, str) for item in items)
+        } if isinstance(menu_items, dict) else {}
+        if data.get("mod_menu_mode") == "quick" and not data["mod_menu_items"]:
+            # Earlier versions stored the old default even before the menu settings were ever opened.
+            data.pop("mod_menu_mode")
+        campaign_options = data.get("campaign_launch_options", {})
+        data["campaign_launch_options"] = {
+            key: value
+            for key, value in campaign_options.items()
+            if isinstance(value, dict) and value.get("mode") in ("steam", "manual")
+            and isinstance(value.get("manual"), str)
+        } if isinstance(campaign_options, dict) else {}
         ignored = data.get("ignored_problems", {})
         if not isinstance(ignored, dict) or any(
             not isinstance(keys, list) or any(

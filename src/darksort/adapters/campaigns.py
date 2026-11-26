@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from darksort.adapters.dson import SavedMod
+from darksort.adapters.launch_options import parse_launch_options
 from darksort.adapters.saves import mods_for_slot, require_game_stopped
 from darksort.adapters.windows_launch import external_program_environment
 from darksort.models import Mod, ResolvedEntry, Source
@@ -87,8 +88,8 @@ def write_launch_profile(data_dir: Path, root: Path, mods: tuple[SavedMod, ...])
     return target, argument
 
 
-def start_game(target: LaunchTarget, profile_argument: str) -> subprocess.Popen:
-    arguments = [str(target.executable), "-mod_profile", profile_argument]
+def start_game(target: LaunchTarget, profile_argument: str, launch_args=()) -> subprocess.Popen:
+    arguments = [str(target.executable), "-mod_profile", profile_argument, *launch_args]
     with external_program_environment() as env:
         if env is None:
             return subprocess.Popen(arguments, cwd=target.root)
@@ -97,7 +98,9 @@ def start_game(target: LaunchTarget, profile_argument: str) -> subprocess.Popen:
 
 def launch_campaign(
     target: LaunchTarget, data_dir: Path, resolved: list[ResolvedEntry], installed: list[Mod],
+    *, rules=(), launch_options="",
 ) -> subprocess.Popen:
+    extra = parse_launch_options(launch_options)
     require_game_stopped(require_steam=target.steam)
     if not supports_launch_profile(target.executable):
         raise ValueError("游戏文件已变化，请重新扫描支持方案启动的版本。")
@@ -105,11 +108,11 @@ def launch_campaign(
         validate_steam_installation(target)
     elif any(row.entry.source is Source.WORKSHOP for row in resolved):
         raise ValueError("计划中有创意工坊 Mod，请选择 Steam 版游戏。")
-    mods = mods_for_slot(resolved, installed, [target.root])
+    mods = mods_for_slot(resolved, installed, [target.root], rules=rules)
     file, argument = write_launch_profile(data_dir, target.root, mods)
     try:
         require_game_stopped(require_steam=target.steam)
-        return start_game(target, argument)
+        return start_game(target, argument, extra.arguments)
     except (OSError, subprocess.SubprocessError):
         file.unlink(missing_ok=True)
         raise

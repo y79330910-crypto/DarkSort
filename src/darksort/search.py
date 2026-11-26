@@ -6,6 +6,17 @@ def search_text(value: str) -> str:
     return " ".join(normalize("NFKC", value).casefold().split())
 
 
+def unique_title(original: str, existing, *, limit: int = 120) -> str:
+    taken = {search_text(title) for title in existing}
+    title = original
+    number = 2
+    while search_text(title) in taken:
+        suffix = f" ({number})"
+        title = original[:limit - len(suffix)].rstrip() + suffix
+        number += 1
+    return title
+
+
 @dataclass(frozen=True)
 class ModLocation:
     side: str

@@ -87,6 +87,25 @@ def test_workshop_install_id_wins_over_stale_xml(tmp_path):
     assert any("不一致" in warning for warning in mod.warnings)
 
 
+def test_path_exclusion_skips_exact_directory_and_child_roots_before_cache(tmp_path):
+    local = tmp_path / "mods"
+    ignored = local / "DD Mod Lib"
+    nested = ignored / "nested"
+    legacy = local / "old_mod"
+    same_name_elsewhere = tmp_path / "other" / ignored.name
+    for directory in (nested, legacy, same_name_elsewhere):
+        directory.mkdir(parents=True)
+    roots = [ScanRoot(path, Source.LOCAL) for path in (local, ignored, same_name_elsewhere.parent)]
+    cache = tmp_path / "scan.sqlite3"
+    initial = scan(roots, cache)
+    assert {mod.path for mod in initial.mods} == {str(path) for path in (ignored, nested, legacy, same_name_elsewhere)}
+
+    filtered = scan(roots, cache, excluded_paths=[str(ignored)])
+    assert {mod.path for mod in filtered.mods} == {str(legacy), str(same_name_elsewhere)}
+    assert filtered.cache_hits == 2
+    assert {mod.path for mod in scan(roots, cache).mods} == {mod.path for mod in initial.mods}
+
+
 def test_multiple_steam_libraries_and_legacy_vdf(tmp_path):
     steam, lib_a, lib_b = [tmp_path / name for name in ("Steam", "库 A", "库 B")]
     (steam / "steamapps").mkdir(parents=True)

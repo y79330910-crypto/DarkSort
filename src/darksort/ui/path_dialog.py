@@ -1,6 +1,8 @@
 from dataclasses import replace
+from pathlib import Path
 
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -8,6 +10,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -21,7 +25,7 @@ class PathDialog(QDialog):
     def __init__(self, settings: Settings, discovery: Discovery | None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("扫描路径 · DarkSort")
-        self.resize(700, 650)
+        self.resize(720, 730)
         self.settings = settings
         layout = QVBoxLayout(self)
         label = QLabel("指定目录只影响扫描范围。Workshop 和本地目录应选择包含各个 Mod 的父目录。")
@@ -48,6 +52,28 @@ class PathDialog(QDialog):
         self.local = self.path_field(
             layout, "本地 mods 根目录（每行一个；留空使用游戏目录/mods）", settings.local_paths
         )
+        layout.addWidget(QLabel("排除目录（同时跳过其中的子目录）"))
+        exclusions = QHBoxLayout()
+        self.excluded = QListWidget()
+        self.excluded.setAccessibleName("已排除的扫描目录")
+        self.excluded.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.excluded.setMaximumHeight(100)
+        self.excluded.addItems(settings.excluded_paths)
+        exclusions.addWidget(self.excluded, 1)
+        exclusion_actions = QVBoxLayout()
+        add = QPushButton("添加排除…")
+        add.clicked.connect(self.choose_exclusion)
+        restore = QPushButton("取消排除")
+        restore.setEnabled(False)
+        restore.clicked.connect(self.restore_exclusions)
+        self.excluded.itemSelectionChanged.connect(
+            lambda: restore.setEnabled(bool(self.excluded.selectedItems()))
+        )
+        exclusion_actions.addWidget(add)
+        exclusion_actions.addWidget(restore)
+        exclusion_actions.addStretch()
+        exclusions.addLayout(exclusion_actions)
+        layout.addLayout(exclusions)
         if discovery:
             detected = "\n".join(f"{root.source.label}：{root.path}" for root in discovery.roots)
             info = QLabel("最近检测到：\n" + (detected or "尚未找到目录"))
@@ -68,6 +94,24 @@ class PathDialog(QDialog):
         )
         if path:
             self.game.setText(path)
+
+    def choose_exclusion(self):
+        path = QFileDialog.getExistingDirectory(self, "选择要排除的目录", self.game.text())
+        if path:
+            try:
+                resolved = Path(path).resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                QMessageBox.warning(self, "无法排除扫描目录", str(exc))
+                return
+            if resolved not in map(Path, self.exclusion_paths()):
+                self.excluded.addItem(str(resolved))
+
+    def restore_exclusions(self):
+        for item in self.excluded.selectedItems():
+            self.excluded.takeItem(self.excluded.row(item))
+
+    def exclusion_paths(self):
+        return [self.excluded.item(row).text() for row in range(self.excluded.count())]
 
     def path_field(self, layout, label, paths):
         layout.addWidget(QLabel(label))
@@ -102,4 +146,5 @@ class PathDialog(QDialog):
             steam_paths=lines(self.steam),
             workshop_paths=lines(self.workshop),
             local_paths=lines(self.local),
+            excluded_paths=self.exclusion_paths(),
         )

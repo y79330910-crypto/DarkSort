@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QToolButton,
     QToolTip,
+    QTreeWidget,
     QWidget,
 )
 
@@ -125,7 +126,7 @@ class ModDelegate(QStyledItemDelegate):
         self.thumbnails = {}
 
     def sizeHint(self, option, index):
-        return QSize(180, 27 if "group" in (index.data(ROLE) or {}) else ROW_HEIGHT)
+        return QSize(0, 27 if "group" in (index.data(ROLE) or {}) else ROW_HEIGHT)
 
     def paint(self, painter: QPainter, option, index):
         data = index.data(ROLE) or {}
@@ -377,6 +378,93 @@ class GroupDragHandle(QToolButton):
             QTimer.singleShot(0, view, lambda: view.dropped.emit(view.side, payload, boundary))
 
 
+class GroupMemberTree(QTreeWidget):
+    member_moved = Signal(str, str, str, bool)
+    drag_state_changed = Signal(bool)
+
+    def __init__(self):
+        super().__init__(objectName="groupShelf")
+        self.profile_id = ""
+        self.dragged = None
+        self.drop_line = None
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDropIndicatorShown(False)
+
+    def startDrag(self, _actions):
+        item = self.currentItem()
+        if not item or not item.parent():
+            return
+        group_id = item.parent().data(0, ROLE)
+        member_id = item.data(0, ROLE).entry.id
+        self.dragged = (group_id, member_id)
+        payload = {"side": "group-member", "profile_id": self.profile_id,
+                   "group_id": group_id, "member_id": member_id}
+        mime = QMimeData()
+        mime.setData(MIME, json.dumps(payload).encode())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(self.viewport().grab(self.visualItemRect(item)))
+        self.drag_state_changed.emit(True)
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            self.dragged = None
+            self.drop_line = None
+            self.viewport().update()
+            self.drag_state_changed.emit(False)
+
+    def dragEnterEvent(self, event):
+        if self.dragged and event.source() is self:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def member_at_drop(self, event):
+        point = event.position().toPoint()
+        item = self.itemAt(point)
+        if (self.dragged and event.source() is self and item and item.parent()
+                and item.parent().data(0, ROLE) == self.dragged[0]):
+            return item, point.y() > self.visualItemRect(item).center().y()
+        return None, False
+
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)
+        item, below = self.member_at_drop(event)
+        self.drop_line = None
+        if item:
+            rect = self.visualItemRect(item)
+            self.drop_line = rect.bottom() if below else rect.top()
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+        self.viewport().update()
+
+    def dragLeaveEvent(self, event):
+        self.drop_line = None
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        item, below = self.member_at_drop(event)
+        self.drop_line = None
+        self.viewport().update()
+        if not item:
+            event.ignore()
+            return
+        group_id, member_id = self.dragged
+        target_id = item.data(0, ROLE).entry.id
+        QTimer.singleShot(0, self, lambda: self.member_moved.emit(group_id, member_id, target_id, below))
+        event.acceptProposedAction()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.drop_line is not None:
+            painter = QPainter(self.viewport())
+            painter.setPen(QPen(QColor(current_theme().accent), 2))
+            painter.drawLine(0, self.drop_line, self.viewport().width(), self.drop_line)
+            painter.end()
+
+
 class ModList(QListWidget):
     dropped = Signal(str, object, int)
     relationship_selected = Signal(str)
@@ -458,7 +546,7 @@ class ModList(QListWidget):
         super().dragMoveEvent(event)
         item = self.itemAt(event.position().toPoint())
         self.drop_line = None
-        self.drop_highlight = isinstance(event.source(), GroupDragHandle)
+        self.drop_highlight = isinstance(event.source(), (GroupDragHandle, GroupMemberTree))
         if self.side == "profile" and item:
             rect = self.visualItemRect(item)
             below = event.position().y() > rect.center().y()
@@ -474,7 +562,7 @@ class ModList(QListWidget):
 
     def accepts_drag(self, event):
         return (not self.reorder_blocked and event.mimeData().hasFormat(MIME)
-                and isinstance(event.source(), (ModList, GroupDragHandle)))
+                and isinstance(event.source(), (ModList, GroupDragHandle, GroupMemberTree)))
 
     def clear_drop_line(self):
         if self.drop_line is not None or self.drop_highlight:
@@ -705,6 +793,8 @@ class ModList(QListWidget):
             source = event.source()
             if isinstance(source, GroupDragHandle):
                 source.result = (self, payload, boundary)
+            elif isinstance(source, GroupMemberTree):
+                QTimer.singleShot(0, self, lambda: self.dropped.emit(self.side, payload, boundary))
             else:
                 self.dropped.emit(self.side, payload, boundary)
             event.acceptProposedAction()

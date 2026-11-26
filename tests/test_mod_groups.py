@@ -14,23 +14,22 @@ def test_groups_keep_membership_and_order_across_export_and_restore_complete_loc
     a, b, c = [ProfileEntry.from_mod(mod, pinned=True) for mod in mods]
     store = ProfileStore(tmp_path / "资料")
     profile = store.new("远征", [c])
-    profile.staged = [a, b]
-    profile.locks = [ProfileLock("需要一起移动", (a.id, b.id))]
     partial = ModGroup("局部", "#e3b574", (b,))
-    bundle = ModGroup("机器人系列", "#75b9ea", (b, a))
+    bundle = ModGroup("机器人系列", "#75b9ea", (a, b), locked=True)
     profile.mod_groups = [bundle, partial]
     path = tmp_path / "分组方案.json"
     store.export_file(profile, path)
     restored = store.import_file(path)
     assert restored.mod_groups == profile.mod_groups and restored.locks == profile.locks
 
-    with pytest.raises(ValueError, match="只包含联锁"):
-        enable_group(restored, partial, resolve_entries(list(partial.members), mods), 0)
     updated, skipped = enable_group(restored, bundle, resolve_entries(list(bundle.members), mods), 0)
-    assert not skipped and not updated.staged
+    assert not skipped
     assert [entry.id for entry in updated.entries] == [a.id, b.id, c.id]
-    assert updated.locks == profile.locks and updated.mod_groups == profile.mod_groups
-    assert restored.entries == [c] and restored.staged == [a, b]
+    assert updated.locks == [ProfileLock(bundle.title, (a.id, b.id))]
+    assert updated.mod_groups == profile.mod_groups
+    assert restored.entries == [c] and not restored.locks
+    with pytest.raises(ValueError, match="只包含联锁"):
+        enable_group(updated, partial, resolve_entries(list(partial.members), mods), 0)
     store.save(updated)
     assert store.load(updated.id).entries == [a, b, c]
 

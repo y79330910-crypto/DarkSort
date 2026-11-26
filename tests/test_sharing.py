@@ -23,7 +23,6 @@ def test_share_round_trip_keeps_local_identities_locks_groups_and_rules(tmp_path
     profile = store.new("远征", [local, workshop])
     group = ModGroup("人物和皮肤", "#bd99e8", (other, workshop, local))
     profile.mod_groups = [group]
-    profile.staged = [other]
     profile.groups = [ProfileGroup(local.id, "开头")]
     profile.locks = [ProfileLock("配套", (local.id, workshop.id))]
     profile.rules = [
@@ -51,12 +50,13 @@ def test_share_round_trip_keeps_local_identities_locks_groups_and_rules(tmp_path
     assert imported.groups == profile.groups and imported.locks == profile.locks
     waiting, available = imported.entries
     assert not waiting.path and not available.path and not available.pinned_path
-    assert waiting.name == imported.staged[0].name and waiting.reference != imported.staged[0].reference
+    group_only = imported.mod_groups[0].members[0]
+    assert waiting.name == group_only.name and waiting.reference != group_only.reference
     assert [member.reference for member in imported.mod_groups[0].members] == [
-        imported.staged[0].reference, workshop.reference, waiting.reference,
+        group_only.reference, workshop.reference, waiting.reference,
     ]
     assert imported.rules[0].first == waiting.reference
-    assert imported.rules[1].second == imported.staged[0].reference
+    assert imported.rules[1].second == group_only.reference
     assert imported.rules[2] == profile.rules[2]
     assert store.load(imported.id).mod_groups == imported.mod_groups
     assert profile_dict(imported)["version"] == 5

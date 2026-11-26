@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from darksort.models import ScanIssue, ScanResult, ScanRoot, Source
@@ -14,6 +14,7 @@ def scan(
     roots: list[ScanRoot],
     cache_path: Path | None = None,
     *,
+    excluded_paths: Iterable[str | Path] = (),
     progress: Callable[[int, int, str], None] = lambda *_: None,
     cancelled: Callable[[], bool] = lambda: False,
     refresh: bool = False,
@@ -27,12 +28,25 @@ def scan(
             result.issues.append(ScanIssue(str(cache_path), f"缓存不可用，改用直接扫描：{exc}"))
     candidates = []
     seen = set()
+    excluded = set()
+    for path in excluded_paths:
+        try:
+            if str(path).strip():
+                excluded.add(Path(path).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            result.issues.append(ScanIssue(str(path), f"无法识别排除目录：{exc}"))
+
+    def is_excluded(path: Path) -> bool:
+        return path in excluded or not excluded.isdisjoint(path.parents)
+
     try:
         for root in roots:
             if cancelled():
                 result.cancelled = True
                 return result
             try:
+                if is_excluded(root.path.resolve()):
+                    continue
                 if (root.path / "project.xml").is_file():
                     result.issues.append(ScanIssue(str(root.path), "请选择包含多个 Mod 的父目录。"))
                     continue
@@ -44,11 +58,14 @@ def scan(
                         continue
                     if folder.name.casefold() in {"downloads", "temp", "downloading"}:
                         continue
-                    key = (str(folder.resolve()).casefold(), root.source)
+                    resolved = folder.resolve()
+                    if is_excluded(resolved):
+                        continue
+                    key = (str(resolved).casefold(), root.source)
                     if key not in seen:
                         candidates.append((folder, root.source))
                         seen.add(key)
-            except OSError as exc:
+            except (OSError, RuntimeError) as exc:
                 result.issues.append(ScanIssue(str(root.path), f"无法读取 Mod 目录：{exc}"))
         total = len(candidates)
         for index, (folder, source) in enumerate(candidates):

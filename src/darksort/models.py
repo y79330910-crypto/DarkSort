@@ -131,6 +131,7 @@ class ModGroup:
     color: str
     members: tuple[ProfileEntry, ...] = ()
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    locked: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,7 +156,6 @@ class Profile:
     entries: list[ProfileEntry] = field(default_factory=list)
     groups: list[ProfileGroup] = field(default_factory=list)
     rules: list[OrderRule] = field(default_factory=list)
-    staged: list[ProfileEntry] = field(default_factory=list)
     locks: list[ProfileLock] = field(default_factory=list)
     mod_groups: list[ModGroup] = field(default_factory=list)
 

@@ -11,14 +11,16 @@ from zlib import error as CompressionError
 
 from darksort.models import ModGroup, Profile, ProfileEntry, Source
 from darksort.profiles import (
+    DEFAULT_PROFILE_NAME,
     MAX_PROFILE_BYTES,
+    MAX_PROFILE_NAME,
     mod_group_dict,
     parse_mod_groups,
     parse_profile,
     profile_dict,
 )
 from darksort.rule_targets import dynamic_target
-from darksort.search import search_text
+from darksort.search import search_text, unique_title
 from darksort.storage import atomic_bytes, atomic_json, read_json
 from darksort.workshop import workshop_id, workshop_page
 
@@ -31,6 +33,20 @@ MAX_SHARE_BYTES = 24 * 1024 * 1024
 def export_filename(title: str, suffix: str) -> str:
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" .")
     return f"DarkSort - {safe or '方案'}{suffix}"
+
+
+def suggested_profile_name(original: str, source: Path, existing) -> str:
+    default_name = re.escape(search_text(DEFAULT_PROFILE_NAME))
+    if re.fullmatch(rf"{default_name}(?: ?\([0-9]+\))?", search_text(original)):
+        candidate = source.stem
+        if source.suffix.casefold() == ".zip" and candidate.casefold().endswith(".darksort"):
+            candidate = candidate[:-len(".darksort")]
+        if candidate.casefold().startswith("darksort - "):
+            candidate = candidate[len("DarkSort - "):]
+        candidate = candidate.strip(" .")
+        if search_text(candidate) not in {"", "方案", "darksort-profile"}:
+            original = candidate[:MAX_PROFILE_NAME].rstrip()
+    return unique_title(original, existing)
 
 
 def portable_entry(entry: ProfileEntry, local_ids: dict[str, str]) -> ProfileEntry:
@@ -65,20 +81,17 @@ def portable_rule_target(reference: str, local_ids: dict[str, str]) -> str:
 
 
 def portable_profile(profile: Profile) -> Profile:
-    # Keep one identity for the same local Mod across plan, staging, groups and rules.
+    # Keep one identity for the same local Mod across plan, groups and rules.
     local_ids: dict[str, str] = {}
     entries = [portable_entry(entry, local_ids) for entry in profile.entries]
-    staged = [portable_entry(entry, local_ids) for entry in profile.staged]
     groups = [portable_group(group, local_ids) for group in profile.mod_groups]
     rules = [replace(rule, first=portable_rule_target(rule.first, local_ids),
                      second=portable_rule_target(rule.second, local_ids)) for rule in profile.rules]
-    return replace(profile, entries=entries, staged=staged, mod_groups=groups, rules=rules)
+    return replace(profile, entries=entries, mod_groups=groups, rules=rules)
 
 
 def mod_checklist(profile: Profile) -> str:
     sections = [("计划顺序（顶部优先）", profile.entries)]
-    if profile.staged:
-        sections.append(("暂存篮", profile.staged))
     sections.extend((f"分组 · {group.title}", group.members) for group in profile.mod_groups)
     lines = [f"DarkSort · {profile.name}", "《暗黑地牢 1》Mod 清单", "",
              "可在 DarkSort 的「文件 → 导入分享包」中载入此包。",
@@ -131,7 +144,7 @@ def read_share_package(path: Path) -> Profile:
 
 def write_group_template(group: ModGroup, path: Path) -> None:
     data = mod_group_dict(portable_group(group, {}))
-    parse_mod_groups({"mod_groups": [data]}, allow_portable=True)
+    parse_mod_groups({"mod_groups": [data]}, allow_portable=True, allow_locked=True)
     atomic_json(path, {"format": TEMPLATE_FORMAT, "version": 1, "group": data},
                 max_bytes=MAX_PROFILE_BYTES)
 
@@ -140,21 +153,10 @@ def read_group_template(path: Path) -> ModGroup:
     data = read_json(path, max_bytes=MAX_PROFILE_BYTES)
     if data.get("format") != TEMPLATE_FORMAT or type(data.get("version")) is not int or data["version"] != 1:
         raise ValueError("请选择 DarkSort 导出的分组模板。")
-    group, = parse_mod_groups({"mod_groups": [data.get("group")]}, allow_portable=True)
+    group, = parse_mod_groups({"mod_groups": [data.get("group")]}, allow_portable=True, allow_locked=True)
     return portable_group(group, {})
 
 
 def group_from_template(profile: Profile, template: ModGroup) -> ModGroup:
     title = unique_title(template.title, (group.title for group in profile.mod_groups))
-    return ModGroup(title, template.color, template.members)
-
-
-def unique_title(original: str, existing) -> str:
-    taken = {search_text(title) for title in existing}
-    title = original
-    number = 2
-    while search_text(title) in taken:
-        suffix = f" ({number})"
-        title = original[:120 - len(suffix)].rstrip() + suffix
-        number += 1
-    return title
+    return ModGroup(title, template.color, template.members, locked=template.locked)

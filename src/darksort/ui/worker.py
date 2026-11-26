@@ -26,6 +26,7 @@ class ScanWorker(QThread):
             result = scan(
                 discovery.roots,
                 self.cache_path,
+                excluded_paths=self.settings.excluded_paths,
                 progress=self.progress.emit,
                 cancelled=self.isInterruptionRequested,
                 refresh=self.refresh,

@@ -19,23 +19,29 @@ from darksort.models import (
     path_key,
 )
 from darksort.rule_targets import dynamic_target, valid_color, validate_target
-from darksort.search import search_text
+from darksort.search import search_text, unique_title
 from darksort.storage import atomic_json, read_json
 
 FORMAT = "darksort.profile"
 GROUPS_VERSION = 4
-VERSION = 5
+PORTABLE_VERSION = 5
+VERSION = 6
 MAX_ENTRIES = 20000
 MAX_RULES = 20000
 MAX_PROFILE_BYTES = 8 * 1024 * 1024
+MAX_PROFILE_NAME = 120
+DEFAULT_PROFILE_NAME = "默认配置"
 
 
 def profile_dict(profile: Profile) -> dict:
-    version = 3 if profile.staged or profile.locks else 2
+    version = 3 if profile.locks else 2
     if profile.mod_groups or any(dynamic_target(key) for rule in profile.rules for key in (rule.first, rule.second)):
         version = GROUPS_VERSION
     member_lists = (group.members for group in profile.mod_groups)
-    if any(entry.portable_id for entry in chain(profile.entries, profile.staged, *member_lists)):
+    if any(entry.portable_id for entry in chain(profile.entries, *member_lists)):
+        version = PORTABLE_VERSION
+    if (any(group.locked for group in profile.mod_groups) or len(profile.mod_groups) > MAX_MOD_GROUPS
+            or sum(len(group.members) for group in profile.mod_groups) > MAX_GROUP_MEMBERS):
         version = VERSION
     payload = {
         "format": FORMAT,
@@ -46,8 +52,7 @@ def profile_dict(profile: Profile) -> dict:
         "groups": [asdict(group) for group in profile.groups],
         "rules": [asdict(rule) for rule in profile.rules],
     }
-    if profile.staged or profile.locks:
-        payload["staged"] = [entry.to_dict() for entry in profile.staged]
+    if profile.locks:
         payload["locks"] = [
             {"title": lock.title, "members": list(lock.members)} for lock in profile.locks
         ]
@@ -57,8 +62,11 @@ def profile_dict(profile: Profile) -> dict:
 
 
 def mod_group_dict(group: ModGroup) -> dict:
-    return {"id": group.id, "title": group.title, "color": group.color,
+    data = {"id": group.id, "title": group.title, "color": group.color,
             "members": [member.to_dict() for member in group.members]}
+    if group.locked:
+        data["locked"] = True
+    return data
 
 
 def parse_profile(data: dict) -> Profile:
@@ -66,7 +74,7 @@ def parse_profile(data: dict) -> Profile:
     if data.get("format") != FORMAT or type(version) is not int or not 1 <= version <= VERSION:
         raise ValueError("不是受支持的 DarkSort 配置文件。")
     name = data.get("name")
-    if not isinstance(name, str) or not name.strip() or len(name) > 120:
+    if not isinstance(name, str) or not name.strip() or len(name) > MAX_PROFILE_NAME:
         raise ValueError("配置名称必须为 1–120 个字符。")
     raw_id = data.get("id")
     if not isinstance(raw_id, str):
@@ -74,7 +82,7 @@ def parse_profile(data: dict) -> Profile:
     profile_id = str(uuid.UUID(raw_id))
     entry_ids = set()
     entries = parse_entries(data.get("entries"), entry_ids, profile_id if version == 1 else None,
-                            allow_portable=version == VERSION)
+                            allow_portable=version >= PORTABLE_VERSION)
     if version == 1:
         return Profile(profile_id, name.strip(), entries)
 
@@ -105,16 +113,66 @@ def parse_profile(data: dict) -> Profile:
         if not isinstance(note, str) or len(note) > 500 or not isinstance(enabled, bool):
             raise ValueError("排序规则的说明或启用状态无效。")
         rules.append(OrderRule(first, second, kind, note, enabled))
-    staged = parse_entries(data.get("staged", []), entry_ids, allow_portable=version == VERSION) if version >= 3 else []
+    staged = (
+        parse_entries(data.get("staged", []), entry_ids, allow_portable=version >= PORTABLE_VERSION)
+        if 3 <= version <= PORTABLE_VERSION else []
+    )
     locks = parse_locks(data, entries, staged) if version >= 3 else []
-    mod_groups = parse_mod_groups(data, allow_portable=version == VERSION) if version >= GROUPS_VERSION else []
-    return Profile(profile_id, name.strip(), entries, groups, rules, staged, locks, mod_groups)
+    mod_groups = (
+        parse_mod_groups(data, allow_portable=version >= PORTABLE_VERSION, allow_locked=version >= VERSION)
+        if version >= GROUPS_VERSION else []
+    )
+    if staged:
+        staged_ids = {entry.id for entry in staged}
+        mod_groups.extend(groups_from_staging(profile_id, staged, locks, mod_groups))
+        locks = [lock for lock in locks if lock.members[0] not in staged_ids]
+    return Profile(profile_id, name.strip(), entries, groups, rules, locks, mod_groups)
 
 
-def parse_mod_groups(data, *, allow_portable=False):
+def groups_from_staging(profile_id, entries, locks, existing):
+    by_start = {lock.members[0]: lock for lock in locks}
+    titles = [group.title for group in existing]
+    identities = {group.id for group in existing}
+    output = []
+    index = 0
+    ordinary = []
+    references = set()
+
+    def append_group(title, members, *, locked=False):
+        title = unique_title(title, titles)
+        seed = "\0".join(("staged", title, members[0].id))
+        identity = str(uuid.uuid5(uuid.UUID(profile_id), seed))
+        while identity in identities:
+            identity = str(uuid.uuid5(uuid.UUID(profile_id), identity))
+        output.append(ModGroup(title, "#bd99e8" if locked else "#75b9ea", tuple(members), identity, locked))
+        titles.append(title)
+        identities.add(identity)
+
+    while index < len(entries):
+        entry = entries[index]
+        lock = by_start.get(entry.id)
+        if ordinary and (lock or entry.reference in references):
+            append_group("迁入的旧暂存", ordinary)
+            ordinary.clear()
+            references.clear()
+        if lock:
+            append_group(lock.title, entries[index:index + len(lock.members)], locked=True)
+            index += len(lock.members)
+        else:
+            ordinary.append(entry)
+            references.add(entry.reference)
+            index += 1
+    if ordinary:
+        append_group("迁入的旧暂存", ordinary)
+    return output
+
+
+def parse_mod_groups(data, *, allow_portable=False, allow_locked=False):
     groups, used_ids, used_titles = [], set(), set()
     total = 0
-    for item in profile_list(data, "mod_groups", MAX_MOD_GROUPS):
+    group_limit = MAX_MOD_GROUPS + MAX_ENTRIES if allow_locked else MAX_MOD_GROUPS
+    member_limit = MAX_GROUP_MEMBERS + MAX_ENTRIES if allow_locked else MAX_GROUP_MEMBERS
+    for item in profile_list(data, "mod_groups", group_limit):
         identity, title, color = item.get("id"), item.get("title"), item.get("color")
         if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity or identity in used_ids:
             raise ValueError("分组的标识无效或重复。")
@@ -124,17 +182,20 @@ def parse_mod_groups(data, *, allow_portable=False):
             raise ValueError("分组颜色无效。")
         members = parse_entries(item.get("members"), set(), allow_portable=allow_portable)
         total += len(members)
-        if total > MAX_GROUP_MEMBERS or len({entry.reference for entry in members}) != len(members):
+        locked = item.get("locked", False)
+        if type(locked) is not bool or (locked and (not allow_locked or len(members) < 2)):
+            raise ValueError("联锁分组需要至少两个组员。")
+        if total > member_limit or (not locked and len({entry.reference for entry in members}) != len(members)):
             raise ValueError("分组成员重复或总数超出上限。")
         used_ids.add(identity)
         used_titles.add(search_text(title))
-        groups.append(ModGroup(title.strip(), color, tuple(members), identity))
+        groups.append(ModGroup(title.strip(), color, tuple(members), identity, locked))
     return groups
 
 
 def parse_entries(items, seen, legacy_profile=None, *, allow_portable=False):
     if not isinstance(items, list) or len(items) + len(seen) > MAX_ENTRIES:
-        raise ValueError(f"计划和暂存合计最多 {MAX_ENTRIES} 项。")
+        raise ValueError(f"方案条目最多 {MAX_ENTRIES} 项。")
     entries = []
     for i, item in enumerate(items, 1):
         if not isinstance(item, dict):
@@ -205,6 +266,10 @@ def profile_list(data: dict, key: str, limit: int) -> list[dict]:
     return value
 
 
+def read_profile_file(path: Path) -> Profile:
+    return parse_profile(read_json(path, max_bytes=MAX_PROFILE_BYTES))
+
+
 class ProfileStore:
     def __init__(self, data_dir: Path):
         self.directory = data_dir / "profiles"
@@ -217,7 +282,7 @@ class ProfileStore:
         profiles, errors = [], []
         for path in self.directory.glob("*.json"):
             try:
-                profile = parse_profile(read_json(path))
+                profile = read_profile_file(path)
                 if path.stem != profile.id:
                     raise ValueError("文件名与配置 ID 不一致")
                 profiles.append(profile)
@@ -239,13 +304,13 @@ class ProfileStore:
 
     def load(self, profile_id: str) -> Profile:
         path = self.path(profile_id)
-        profile = parse_profile(read_json(path))
+        profile = read_profile_file(path)
         if profile.id != path.stem:
             raise ValueError("文件名与配置 ID 不一致。")
         return profile
 
     def import_file(self, path: Path) -> Profile:
-        return self.import_profile(parse_profile(read_json(path)))
+        return self.import_profile(read_profile_file(path))
 
     def import_profile(self, profile: Profile) -> Profile:
         # Import always creates a new local profile; never overwrites an existing one.
@@ -261,6 +326,26 @@ class ProfileStore:
         duplicate = replace(profile, id=str(uuid.uuid4()), name=name.strip())
         self.save(duplicate)
         return self.load(duplicate.id)
+
+    def rename(self, profile_id: str, name: str) -> Profile:
+        profile = self.load(profile_id)
+        name = name.strip()
+        if name == profile.name:
+            return profile
+        names = {search_text(item.name) for item in self.list()[0] if item.id != profile_id}
+        if search_text(name) in names:
+            raise ValueError("已有同名方案，请换一个名称。")
+        renamed = replace(profile, name=name)
+        self.save(renamed)
+        return renamed
+
+    def archive(self, profile_id: str) -> Path:
+        original = self.path(profile_id)
+        archive = self.directory.parent / "deleted-profiles"
+        archive.mkdir(exist_ok=True)
+        destination = archive / f"{original.stem}-{uuid.uuid4().hex}.json"
+        original.rename(destination)
+        return destination
 
 
 def resolve_entries(entries: list[ProfileEntry], mods: list[Mod]) -> list[ResolvedEntry]:

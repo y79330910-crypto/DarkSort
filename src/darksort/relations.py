@@ -42,29 +42,31 @@ def related_mods(
     profile: Profile,
     installed: list[Mod],
     resolved: list[ResolvedEntry],
-    staged: list[ResolvedEntry],
+    group_entries: dict[str, tuple[ResolvedEntry, str]],
     classifications: dict[str, Classification],
 ) -> list[RelatedMod]:
     if mod is None and entry is None:
         return []
     reference = entry.reference if entry else mod.reference
-    by_reference = {"profile": defaultdict(list), "staging": defaultdict(list)}
-    by_install = {"profile": defaultdict(list), "staging": defaultdict(list)}
-    for side, rows in (("profile", resolved), ("staging", staged)):
-        for index, row in enumerate(rows):
-            caption = f"计划 #{index + 1}" if side == "profile" else "暂存篮"
-            if row.mod is None:
-                caption += " · 待匹配"
-            destination = RelationDestination(
-                ModLocation(side, row.entry.id), row.mod.name if row.mod else row.entry.name,
-                caption, row.mod.path if row.mod else row.entry.path,
-            )
-            by_reference[side][row.entry.reference].append(destination)
-            if row.mod:
-                by_install[side][row.mod.key].append(destination)
+    by_reference = defaultdict(list)
+    by_install = defaultdict(list)
+    group_targets = defaultdict(list)
+    for index, row in enumerate(resolved):
+        caption = f"计划 #{index + 1}" + (" · 待匹配" if row.mod is None else "")
+        destination = RelationDestination(
+            ModLocation("profile", row.entry.id), row.mod.name if row.mod else row.entry.name,
+            caption, row.mod.path if row.mod else row.entry.path,
+        )
+        by_reference[row.entry.reference].append(destination)
+        if row.mod:
+            by_install[row.mod.key].append(destination)
+    for identity, (row, title) in group_entries.items():
+        group_targets[row.entry.reference].append(RelationDestination(
+            ModLocation("group", identity), row.entry.name, f"分组 · {title}", row.entry.path,
+        ))
 
     def installed_destinations(candidate):
-        return by_install["profile"].get(candidate.key) or by_install["staging"].get(candidate.key) or [
+        return by_install.get(candidate.key) or [
             RelationDestination(ModLocation("library", candidate.key), candidate.name, "可用库", candidate.path)
         ]
 
@@ -78,17 +80,17 @@ def related_mods(
             kind = "本 Mod 需要" if first else "需要本 Mod"
         else:
             kind = "本 Mod 应在其上" if first else "本 Mod 应在其下"
-        destinations = by_reference["profile"].get(target) or by_reference["staging"].get(target)
+        destinations = by_reference.get(target)
         if not destinations:
             destinations = [
                 destination for candidate in installed if candidate.reference == target
                 for destination in installed_destinations(candidate)
-            ]
+            ] or group_targets.get(target, ())
         rules.append(describe_relation(target, kind, f"用户规则 · {rule.note or kind}", rule.kind, destinations))
 
     automatic = []
     if mod:
-        for identifier, kind, candidates in skin_partners(mod, installed, by_install["profile"], classifications):
+        for identifier, kind, candidates in skin_partners(mod, installed, by_install, classifications):
             choices = [destination for candidate in candidates for destination in installed_destinations(candidate)]
             automatic.append(describe_relation(
                 identifier, kind, f"人物资源标识一致 · {identifier}", "above", choices,

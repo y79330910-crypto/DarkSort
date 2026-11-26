@@ -12,15 +12,24 @@ def test_profile_round_trips_a_parked_lock_and_rejects_split_members(tmp_path, m
     store = ProfileStore(tmp_path)
     a, b, c = [ProfileEntry.from_mod(mod) for mod in mods]
     profile = store.new("队列", [c])
-    profile.staged = [a, b]
-    profile.locks = [ProfileLock("配套包", (a.id, b.id))]
-    store.save(profile)
+    legacy = profile_dict(profile) | {
+        "version": 3,
+        "staged": [a.to_dict(), b.to_dict()],
+        "locks": [{"title": "配套包", "members": [a.id, b.id]}],
+    }
+    migrated = parse_profile(legacy)
+    group, = migrated.mod_groups
+    assert migrated.entries == [c] and not migrated.locks
+    assert group.title == "配套包" and group.locked and group.members == (a, b)
+    assert parse_profile(legacy).mod_groups[0].id == group.id
+    store.save(migrated)
     loaded = store.load(profile.id)
-    assert profile_dict(loaded) == profile_dict(profile)
+    assert profile_dict(loaded) == profile_dict(migrated)
+    assert "staged" not in profile_dict(loaded)
 
-    broken = replace(profile, entries=[b, c], staged=[a])
+    broken = legacy | {"entries": [b.to_dict(), c.to_dict()], "staged": [a.to_dict()]}
     with pytest.raises(ValueError, match="连续"):
-        parse_profile(profile_dict(broken))
+        parse_profile(broken)
 
 
 def test_sort_moves_a_contiguous_lock_across_a_reserved_slot(tmp_path, mods):

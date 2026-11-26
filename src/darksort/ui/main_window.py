@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import copy
+import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from platformdirs import user_documents_path
-from PySide6.QtCore import QItemSelectionModel, QSignalBlocker, Qt, QTimer, QUrl
+from PySide6.QtCore import QFile, QItemSelectionModel, QSignalBlocker, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -28,15 +29,23 @@ from PySide6.QtWidgets import (
 
 from darksort import __version__
 from darksort.adapters.campaigns import discover_launch_targets
-from darksort.adapters.saves import entries_from_slot
+from darksort.adapters.saves import entries_from_slot, require_game_stopped
 from darksort.ai_client import AIError, AIProvider, AISettingsStore
 from darksort.ai_tasks import preview_ai_order, sort_payload
 from darksort.classification import Category, Classification, classify_mod
 from darksort.conflicts import ConflictReport, reorder_conflicts
+from darksort.dependencies import check_removal, enable_requirements, required_edges, required_mods
 from darksort.diagnostics import file_problems, installation_problems
+from darksort.file_replacements import FilePackStore, ModOrigin
 from darksort.history import ProfileHistory
+from darksort.local_mods import copy_workshop_to_local, create_blank, local_installation, mod_parent
 from darksort.locks import entry_units, expand_selection, lock_starts, nudge_units, snap_boundary
-from darksort.mod_groups import check_complete_locks, enable_group, members_in_plan
+from darksort.mod_groups import (
+    check_complete_locks,
+    enable_group,
+    groups_for_disabled_locks,
+    members_in_plan,
+)
 from darksort.mod_text_batch import MOD_TEXT_FIELDS
 from darksort.models import (
     Mod,
@@ -47,17 +56,22 @@ from darksort.models import (
     ProfileLock,
     ResolvedEntry,
     ScanResult,
+    Source,
 )
 from darksort.profiles import (
+    DEFAULT_PROFILE_NAME,
     MAX_ENTRIES,
     ProfileStore,
     parse_profile,
     profile_dict,
+    read_profile_file,
     resolve_entries,
 )
 from darksort.relations import RelatedMod, related_mods
 from darksort.rule_targets import target_labels
-from darksort.scanning.discovery import Discovery, steam_locations
+from darksort.save_bindings import SaveBindings
+from darksort.scanning.discovery import Discovery, discover, steam_locations
+from darksort.scanning.metadata import parse_mod
 from darksort.search import ModLocation, SearchRecord, search_text
 from darksort.settings import DEFAULT_THEME, MARK_COLORS, Settings
 from darksort.sharing import (
@@ -65,7 +79,6 @@ from darksort.sharing import (
     group_from_template,
     read_group_template,
     read_share_package,
-    unique_title,
     write_group_template,
     write_share_package,
 )
@@ -75,8 +88,12 @@ from darksort.ui.ai_dialogs import AISettingsDialog, AssistantPanel, ModTextDial
 from darksort.ui.appearance import AppearanceDialog, show_artwork
 from darksort.ui.campaign_dialog import CampaignDialog
 from darksort.ui.conflict_dialog import ConflictWorker
+from darksort.ui.feature_guide import FeatureGuideDialog
+from darksort.ui.file_replacements import FilePackDialog, run_operation
 from darksort.ui.group_panel import GroupMemberRow, ModGroupDialog
+from darksort.ui.local_mods import NewModDialog, WorkshopCopyDialog
 from darksort.ui.mod_list import ROLE
+from darksort.ui.mod_menu import MenuCommand, ModMenuDialog, popup_mod_menu
 from darksort.ui.path_dialog import PathDialog
 from darksort.ui.plan_dialogs import (
     HistoryDialog,
@@ -85,18 +102,20 @@ from darksort.ui.plan_dialogs import (
     confirmation_dialog,
     transfer_matches,
 )
+from darksort.ui.profile_dialogs import ProfileImportDialog, ProfileManagerDialog
 from darksort.ui.save_dialog import SaveDialog
 from darksort.ui.search import GlobalSearchDialog
 from darksort.ui.theme import THEMES, apply_theme, icon, problem_color
 from darksort.ui.workbench import build_workbench, button, label
 from darksort.ui.worker import ScanWorker
 from darksort.ui.workshop import open_workshop_page, workshop_id, workshop_page
+from darksort.workshop import workshop_link_id
 
 
 @dataclass(frozen=True)
 class RelationOrigin:
     target: ModLocation
-    scroll_values: tuple[int, int, int]
+    scroll_values: tuple[int, ...]
     collapsed_groups: frozenset[str]
     temporary: ModLocation | None
     utility_tab: int
@@ -129,6 +148,11 @@ class MainWindow(QMainWindow):
             self.startup_errors.append(f"设置无法读取，当前使用默认设置：{exc}")
         self.store = ProfileStore(data_dir)
         self.history = ProfileHistory(data_dir)
+        self.save_bindings = SaveBindings(data_dir)
+        self.file_packs = FilePackStore(data_dir)
+        packs, errors = self.file_packs.list()
+        self.file_tool_keys = {pack.origin.key for pack in packs if pack.origin}
+        self.startup_errors.extend(errors)
         self.ai_store = AISettingsStore(data_dir)
         try:
             self.ai_provider, self.ai_warning = self.ai_store.load()
@@ -144,7 +168,7 @@ class MainWindow(QMainWindow):
         profiles, errors = self.store.list()
         self.startup_errors.extend(errors)
         if not profiles:
-            profiles = [self.store.new("默认配置")]
+            profiles = [self.store.new(DEFAULT_PROFILE_NAME)]
         self.profile = next(
             (p for p in profiles if p.id == self.settings.last_profile), profiles[0]
         )
@@ -157,10 +181,13 @@ class MainWindow(QMainWindow):
         self.discovery: Discovery | None = None
         self.scan_result = ScanResult()
         self.worker: ScanWorker | None = None
+        self._rescan_after_worker = False
         self._launched_game = None
         self._close_pending = False
         self._detail_mod: Mod | None = None
         self._detail_target: ModLocation | None = None
+        self._note_reference = ""
+        self._pane_widths = [246, 283, 650, 282]
         self._relation_anchor: ModLocation | None = None
         self._relation_origin: RelationOrigin | None = None
         self._temporary_target: ModLocation | None = None
@@ -190,7 +217,7 @@ class MainWindow(QMainWindow):
         apply_theme(QApplication.instance(), self.settings.theme)
         self.setWindowTitle("DarkSort · 暗黑地牢 Mod 配置管理")
         self.resize(1510, 895)
-        self.setMinimumSize(1030, 670)
+        self.setMinimumHeight(515)
         self.build_ui()
         self.populate_profiles()
         self.render_lists()
@@ -230,7 +257,8 @@ class MainWindow(QMainWindow):
         return True
 
     def render_draft(self, profile: Profile):
-        self.profile = profile
+        # An undo command may predate a saved rename.
+        self.profile = replace(profile, name=self.profile.name)
         self.render_lists()
 
     def populate_profiles(self):
@@ -253,11 +281,8 @@ class MainWindow(QMainWindow):
             if "entry_id" in item.data(ROLE)
         }
         self.resolved = resolve_entries(self.profile.entries, self.mods)
-        self.staged_resolved = resolve_entries(self.profile.staged, self.mods) if self.profile.staged else []
         self.mods_by_key = {mod.key: mod for mod in self.mods}
-        self.staged_keys = {row.mod.key: row.entry.id for row in self.staged_resolved if row.mod}
         self.plan_positions = {row.entry.id: i for i, row in enumerate(self.resolved)}
-        self.stage_positions = {row.entry.id: i for i, row in enumerate(self.staged_resolved)}
         self.group_marks = defaultdict(list)
         for group in self.profile.mod_groups:
             for member in group.members:
@@ -267,7 +292,7 @@ class MainWindow(QMainWindow):
         self.lock_by_entry = {member: lock for lock in self.profile.locks for member in lock.members}
         self.profile_list.units = self.plan_units if self.active_locks else []
         self.refresh_plan_problems()
-        used = {entry.mod.key for entry in self.resolved if entry.mod} | self.staged_keys.keys()
+        used = {entry.mod.key for entry in self.resolved if entry.mod}
         order = self.library_search.order
         if order == "category":
             mods = sorted(self.mods, key=lambda mod: (
@@ -276,17 +301,22 @@ class MainWindow(QMainWindow):
         else:
             mods = sorted(self.mods, key=lambda m: browse_key(m, order, self.display_name(m.reference, m.name)),
                           reverse=order == "name_desc")
-        available = [mod for mod in mods if mod.key not in used]
+        available = [mod for mod in mods if mod.key not in used and mod.key not in self.file_tool_keys]
         self.available_keys = {mod.key for mod in available}
+        self.group_rows = self.mod_group_rows()
+        self.group_entries = {
+            row.target.identity: (ResolvedEntry(row.entry, None, row.status), group.title)
+            for group, members in self.group_rows for row in members if row.target.side == "group"
+        }
         self.search_records = {
             "library": [self.search_record(ModLocation("library", mod.key), mod, None, "可用") for mod in available],
             "profile": [
                 self.search_record(ModLocation("profile", row.entry.id), row.mod, row, f"计划 #{i + 1}")
                 for i, row in enumerate(self.resolved)
             ],
-            "staging": [
-                self.search_record(ModLocation("staging", row.entry.id), row.mod, row, "暂存")
-                for row in self.staged_resolved
+            "group": [
+                self.search_record(ModLocation("group", identity), None, row, f"分组 · {title}")
+                for identity, (row, title) in self.group_entries.items()
             ],
         }
         if self._temporary_target and not self.location_exists(self._temporary_target):
@@ -303,7 +333,7 @@ class MainWindow(QMainWindow):
                 if self.problem_filter else self.passes_filters(self.profile_search, record, row.mod, row.entry)
             )
         }
-        if self._temporary_target and self._temporary_target in self.matching_targets[self._temporary_target.side]:
+        if self._temporary_target and self._temporary_target in self.matching_targets.get(self._temporary_target.side, ()):
             self._temporary_target = None
         shown = [
             mod for mod, record in zip(available, self.search_records["library"], strict=True)
@@ -341,8 +371,7 @@ class MainWindow(QMainWindow):
                 label_text = ""
             bar.summary.setText(label_text)
         self.profile_list.reorder_blocked = self.plan_is_filtered() or visible != len(self.resolved)
-        self.utility.set_groups(self.profile.id, self.mod_group_rows(), self.groups_by_index(), self.active_locks)
-        self.utility.set_staged(self.staged_resolved, lock_starts(self.profile.staged, self.profile.locks))
+        self.utility.set_groups(self.profile.id, self.group_rows, self.groups_by_index(), self.active_locks)
         self.refresh_search_hits("library")
         self.refresh_search_hits("profile")
         self.refresh_detail()
@@ -363,7 +392,7 @@ class MainWindow(QMainWindow):
         original = mod.name if mod else entry.name
         reference = mod.reference if mod else entry.reference
         name = self.display_name(reference, original)
-        workshop_id = (mod.workshop_id if mod else None) or (entry.workshop_id if entry else None)
+        identifier = self.workshop_identifier(mod, entry)
         source = mod.source if mod else entry.source
         if mod:
             metadata = f"{source.label} {self.classifications[mod.key].label} {' '.join(self.mod_tags(mod))}"
@@ -378,10 +407,10 @@ class MainWindow(QMainWindow):
         if entry:
             details += f" {entry.path}"
         caption = f"{location} · {source.label}"
-        if workshop_id:
-            caption += f" · {workshop_id}"
+        if identifier:
+            caption += f" · {identifier}"
         return SearchRecord.create(target, name, caption, (name, original, entry.name if entry else original),
-                                   workshop_id, metadata, details)
+                                   identifier, metadata, details)
 
     def passes_filters(self, bar, record, mod, entry=None):
         conditions = bar.conditions
@@ -444,7 +473,7 @@ class MainWindow(QMainWindow):
 
     def search_all(self):
         records = self.search_records
-        dialog = GlobalSearchDialog(records["profile"] + records["library"] + records["staging"], self)
+        dialog = GlobalSearchDialog(records["profile"] + records["library"] + records["group"], self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.target:
             self.navigate(dialog.target)
 
@@ -572,12 +601,14 @@ class MainWindow(QMainWindow):
         item.setSelected(selected)
 
     def clear_detail(self):
+        self.set_detail_note("")
         self._detail_mod = None
         self._detail_target = None
         self._relation_anchor = None
         self._relation_origin = None
         self._detail_workshop_id = None
         self.detail_title.setText("选择一个 Mod")
+        self.detail_title.setToolTip("")
         self.detail_original.hide()
         self.detail_art.set_art(None)
         for value in self.detail_facts.values():
@@ -644,20 +675,22 @@ class MainWindow(QMainWindow):
     def location_exists(self, target):
         if target.side == "library":
             return target.identity in self.available_keys
-        positions = self.plan_positions if target.side == "profile" else self.stage_positions
-        return target.identity in positions
+        if target.side == "group":
+            return target.identity in self.group_entries
+        return target.identity in self.plan_positions
 
     def row_value(self, target):
         if target.side == "library":
             return target.identity
-        positions = self.plan_positions if target.side == "profile" else self.stage_positions
-        return positions[target.identity]
+        return self.plan_positions[target.identity]
 
     def location_details(self, target):
+        if target.side == "group":
+            return None, self.group_entries[target.identity][0]
         value = self.row_value(target)
         if target.side == "library":
             return self.mods_by_key[value], None
-        row = (self.resolved if target.side == "profile" else self.staged_resolved)[value]
+        row = self.resolved[value]
         return row.mod, row
 
     def show_detail(self, target):
@@ -666,9 +699,7 @@ class MainWindow(QMainWindow):
         self._detail_target = target
         self.library_list.detail_mark = target.identity if target.side == "library" else None
         self.profile_list.detail_mark = self.row_value(target) if target.side == "profile" else None
-        identifier = workshop_id(mod.workshop_id if mod else None) or workshop_id(
-            resolved.entry.workshop_id if resolved else None
-        )
+        identifier = self.workshop_identifier(mod, resolved.entry if resolved else None)
         self._detail_workshop_id = identifier
         self.shop_links.setVisible(bool(identifier))
         self.open_folder_button.setEnabled(mod is not None)
@@ -679,6 +710,8 @@ class MainWindow(QMainWindow):
         reference = mod.reference if mod else resolved.entry.reference
         name = self.display_name(reference, original)
         self.detail_title.setText(name)
+        self.detail_title.setToolTip("双击编辑别名、简介和备注" if mod else "")
+        self.set_detail_note(reference)
         self.detail_original.setText(f"原名 · {original}")
         self.detail_original.setVisible(name != original)
         self.update_detail_marks(reference)
@@ -700,8 +733,8 @@ class MainWindow(QMainWindow):
             self.detail_facts["版本"].setToolTip("")
             self.detail_tags.set_tags(())
             hint = (
-                "加入计划后可用「匹配」选择对应安装。"
-                if target.side == "staging" else "选中计划条目，再用「匹配」选择对应安装。"
+                "右键组员并选择「手动匹配本机 Mod」。"
+                if target.side == "group" else "选中计划条目，再用「匹配」选择对应安装。"
             )
             self.detail_description.setPlainText(hint)
             warning = resolved.problem
@@ -720,7 +753,7 @@ class MainWindow(QMainWindow):
             title = mod.name if mod else row.entry.name
             relations = related_mods(
                 mod, row.entry if row else None, self.profile, self.mods,
-                self.resolved, self.staged_resolved, self.classifications,
+                self.resolved, self.group_entries, self.classifications,
             )
         self.library_list.relation_marks = {
             relation.target.identity for relation in relations
@@ -815,8 +848,8 @@ class MainWindow(QMainWindow):
         self._detail_target = target
         if previous != self._temporary_target or expanded:
             self.render_lists()
-        if target.side == "staging":
-            self.show_utility_page(self.utility.stage_page)
+        if target.side == "group":
+            self.show_utility_page(self.utility.groups_page)
         elif keep_anchor and self._relation_origin:
             self.show_utility_page(self.utility.relation_page)
         self.show_detail(target)
@@ -832,19 +865,17 @@ class MainWindow(QMainWindow):
             self.point_to_location(target, focus=False)
 
     def navigation_lists(self):
-        return self.library_list, self.profile_list, self.utility.staging
+        return self.library_list, self.profile_list, self.utility.group_shelf.tree
 
     def point_to_location(self, target, *, focus=True, select=False):
-        widget = {
-            "library": self.library_list, "profile": self.profile_list, "staging": self.utility.staging,
-        }[target.side]
+        if target.side == "group":
+            self.utility.group_shelf.reveal_member(*target.identity.split(":", 1), focus=focus)
+            return
+        widget = self.library_list if target.side == "library" else self.profile_list
         for index in range(widget.count()):
             item = widget.item(index)
             data = item.data(ROLE)
-            if target.side == "staging":
-                matches = target.identity in data
-            else:
-                matches = "group" not in data and self.item_location(target.side, item) == target
+            matches = "group" not in data and self.item_location(target.side, item) == target
             if matches:
                 flags = QItemSelectionModel.SelectionFlag
                 with QSignalBlocker(widget):
@@ -879,13 +910,6 @@ class MainWindow(QMainWindow):
         self.show_utility_page(self.utility.relation_page)
         self.update_relations()
 
-    def click_staged_item(self, item):
-        members = item.data(ROLE)
-        if len(members) == 1:
-            target = ModLocation("staging", members[0])
-            if target != self._detail_target:
-                self.inspect_selection(target)
-
     def preview_cover(self):
         if self._detail_mod and self._detail_mod.preview_path:
             show_artwork(self, self._detail_mod.preview_path, self._detail_mod.name)
@@ -893,6 +917,42 @@ class MainWindow(QMainWindow):
     def open_mod_folder(self, *, mod=None):
         if (target := mod or self._detail_mod) and not QDesktopServices.openUrl(QUrl.fromLocalFile(target.path)):
             self.statusBar().showMessage(f"无法打开目录 · {target.path}", 5000)
+
+    def workshop_identifier(self, mod: Mod | None, entry: ProfileEntry | None = None) -> str | None:
+        if mod and (native := workshop_id(mod.workshop_id)):
+            return native
+        subject = mod or entry
+        if subject and subject.source == Source.LOCAL:
+            if linked := workshop_id(self.settings.mod_workshop_links.get(subject.reference)):
+                return linked
+        return workshop_id(entry.workshop_id if entry else None)
+
+    def associate_workshop(self, mod: Mod):
+        reference = mod.reference
+        links = self.settings.mod_workshop_links.copy()
+        text, accepted = QInputDialog.getText(
+            self, "关联创意工坊", "粘贴创意工坊链接或输入数字 ID。清空可移除关联。",
+            text=workshop_page(links.get(reference)),
+        )
+        if not accepted:
+            return
+        text = text.strip()
+        if text:
+            number = workshop_link_id(text) or workshop_id(search_text(text))
+            if not number:
+                self.error("工坊地址无效", "请输入有效的工坊链接或数字 ID。")
+                return
+            links[reference] = number
+        else:
+            links.pop(reference, None)
+        try:
+            updated = replace(self.settings, mod_workshop_links=links)
+            updated.save(self.data_dir)
+        except OSError as exc:
+            self.error("无法保存工坊关联", str(exc))
+            return
+        self.settings = updated
+        self.render_lists()
 
     def open_workshop(self, *, identifier=None, browser=False):
         identifier = identifier or self._detail_workshop_id
@@ -933,13 +993,21 @@ class MainWindow(QMainWindow):
         self.toggle_pane(self.utility)
 
     def toggle_pane(self, pane):
-        opening = pane.isHidden()
-        pane.setVisible(opening)
-        if opening:
-            sizes = self.panes.sizes()
-            sizes[self.panes.indexOf(pane)] = 247
-            sizes[2] = max(324, sizes[2] - 247)
-            self.panes.setSizes(sizes)
+        sizes = self.panes.sizes()
+        index = self.panes.indexOf(pane)
+        if sizes[index] and sum(size > 0 for size in sizes) > 1:
+            self._pane_widths[index] = sizes[index]
+            sizes[index] = 0
+        elif not sizes[index]:
+            sizes[index] = self._pane_widths[index]
+        self.panes.setSizes(sizes)
+        self.remember_pane_sizes()
+
+    def remember_pane_sizes(self, *_):
+        sizes = self.panes.sizes()
+        if any(sizes):
+            self.settings.pane_sizes = sizes
+            self._pane_widths = [size or old for size, old in zip(sizes, self._pane_widths, strict=True)]
 
     def toggle_dock(self):
         if self.dock.isVisible() and self.workspace_split.sizes()[1] > 0:
@@ -1083,8 +1151,10 @@ class MainWindow(QMainWindow):
         if not mod:
             return
         reference = mod.reference
+        self.save_detail_note()
+        previous_note = self.settings.mod_notes.get(reference, "")
         original = (self.settings.mod_aliases.get(reference, ""), self.settings.mod_translations.get(reference, ""))
-        dialog = ModTextDialog(self, mod, *original)
+        dialog = ModTextDialog(self, mod, *original, previous_note)
         if generate:
             QTimer.singleShot(0, dialog, dialog.generate)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1094,8 +1164,9 @@ class MainWindow(QMainWindow):
             field: value for field, value, before in zip(MOD_TEXT_FIELDS, dialog.text_values(), original, strict=True)
             if value != before or dialog.clear_requested
         }
+        note = dialog.note.text().strip()
         dialog.deleteLater()
-        if not changes:
+        if not changes and note == previous_note:
             return
         aliases = self.settings.mod_aliases.copy()
         translations = self.settings.mod_translations.copy()
@@ -1106,29 +1177,60 @@ class MainWindow(QMainWindow):
             else:
                 maps[field].pop(reference, None)
         try:
-            self.save_mod_display(aliases, translations)
+            self.save_mod_display(aliases, translations, notes=self.notes_with(reference, note))
         except (OSError, ValueError) as exc:
-            self.error("无法保存别名和简介", str(exc))
+            self.error("无法保存 Mod 文本", str(exc))
             return
         self.mod_text_batch.keep_manual_fields(reference, changes)
         self.render_lists()
 
-    def save_mod_display(self, aliases, translations):
+    def save_mod_display(self, aliases, translations, *, notes=None):
         updated = replace(self.settings, mod_aliases=aliases, mod_translations=translations)
+        if notes is not None:
+            updated.mod_notes = notes
         updated.save(self.data_dir)
         self.settings = updated
+
+    def notes_with(self, reference, note):
+        notes = self.settings.mod_notes.copy()
+        if note:
+            notes[reference] = note
+        else:
+            notes.pop(reference, None)
+        return notes
+
+    def save_detail_note(self):
+        reference = self._note_reference
+        note = self.detail_note.text().strip()
+        if reference and note != self.settings.mod_notes.get(reference, ""):
+            updated = replace(self.settings, mod_notes=self.notes_with(reference, note))
+            try:
+                updated.save(self.data_dir)
+            except (OSError, ValueError) as exc:
+                self.error("无法保存备注", str(exc))
+                return
+            self.settings = updated
+        self.detail_note.setModified(False)
+
+    def set_detail_note(self, reference):
+        if self._note_reference != reference:
+            self.save_detail_note()
+            self._note_reference = reference
+        elif self.detail_note.isModified():
+            return
+        self.detail_note.setEnabled(bool(reference))
+        self.detail_note.setText(self.settings.mod_notes.get(reference, ""))
 
     def mod_group_rows(self):
         groups = self.profile.mod_groups
         if not groups:
             return []
-        occupied = {}
-        for side, rows in (("profile", self.resolved), ("staging", self.staged_resolved)):
-            for number, row in enumerate(rows, 1):
-                status = f"已加入计划 #{number}" if side == "profile" else "暂存中"
-                if not row.mod:
-                    status += " · 待匹配"
-                occupied.setdefault(row.entry.reference, (ModLocation(side, row.entry.id), status, row.mod))
+        by_reference = defaultdict(list)
+        by_install = {}
+        for row in self.resolved:
+            by_reference[row.entry.reference].append(row)
+            if row.mod:
+                by_install[row.mod.key] = row
         entries = list(dict.fromkeys(member for group in groups for member in group.members))
         installed = {row.entry: row for row in resolve_entries(entries, self.mods)}
         output = []
@@ -1136,14 +1238,23 @@ class MainWindow(QMainWindow):
             members = []
             for member in group.members:
                 reference = member.reference
-                target, status, mod = occupied.get(reference, (None, "", None))
-                if target is None:
-                    resolved = installed[member]
-                    mod = resolved.mod
-                    if mod and mod.key in self.available_keys:
-                        target, status = ModLocation("library", mod.key), "可用 · 尚未加入计划"
-                    else:
-                        status = resolved.problem or "当前安装已被其他计划条目使用"
+                resolved = installed[member]
+                mod = resolved.mod
+                candidates = by_reference[reference]
+                active = by_install.get(mod.key) if mod else None
+                if active is None and len(candidates) == 1 and not candidates[0].mod:
+                    active = candidates[0]
+                if active:
+                    mod = active.mod
+                    target = ModLocation("profile", active.entry.id)
+                    status = f"已加入计划 #{self.plan_positions[active.entry.id] + 1}"
+                    if not mod:
+                        status += " · 待匹配"
+                elif mod and mod.key in self.available_keys:
+                    target, status = ModLocation("library", mod.key), "可用 · 尚未加入计划"
+                else:
+                    target = ModLocation("group", f"{group.id}:{member.id}")
+                    status = resolved.problem or "已转入游戏文件替换"
                 members.append(GroupMemberRow(
                     member, self.display_name(reference, mod.name if mod else member.name), target, status,
                     self.mod_tags(mod) if mod else (),
@@ -1153,6 +1264,16 @@ class MainWindow(QMainWindow):
 
     def find_mod_group(self, identity):
         return next((group for group in self.profile.mod_groups if group.id == identity), None)
+
+    def move_group_member(self, identity, member_id, target_id, below):
+        group = self.find_mod_group(identity)
+        if not group or member_id == target_id:
+            return
+        positions = {member.id: index for index, member in enumerate(group.members)}
+        if member_id not in positions or target_id not in positions:
+            return
+        ordered = move_entries(list(group.members), [positions[member_id]], positions[target_id] + int(below))
+        self.save_mod_group(replace(group, members=tuple(ordered)), action="调整组员顺序")
 
     def export_group_template(self, identity):
         group = self.find_mod_group(identity)
@@ -1188,23 +1309,31 @@ class MainWindow(QMainWindow):
             self.show_utility_page(self.utility.groups_page)
             self.statusBar().showMessage(f"已载入「{group.title}」。可撤销本次操作。", 5000)
 
-    def relink_group_member(self, identity, reference):
+    def relink_group_member(self, identity, member_id, *, mod=None):
         group = self.find_mod_group(identity)
-        member = next((entry for entry in group.members if entry.reference == reference), None) if group else None
-        if not member or not (mod := self.choose_installed_mod(member)):
+        member = next((entry for entry in group.members if entry.id == member_id), None) if group else None
+        if not member or not (mod := mod or self.choose_installed_mod(member)):
             return
         replacement = replace(ProfileEntry.from_mod(mod, pinned=True), id=member.id)
         if any(entry.reference == replacement.reference for entry in group.members if entry.id != member.id):
             self.error("无法匹配组员", "所选 Mod 已经在这个分组内。请选择对应的另一项。")
             return
         updated = replace(group, members=tuple(replacement if entry.id == member.id else entry for entry in group.members))
-        self.save_mod_group(updated, action="手动匹配组员")
+        still_used = any(entry.reference == member.reference for entry in self.profile.entries) or any(
+            entry.reference == member.reference
+            for other in self.profile.mod_groups for entry in other.members
+            if (other.id, entry.id) != (identity, member_id)
+        )
+        rules = self.profile.rules if still_used else self.retarget_rules(
+            self.profile.rules, member.reference, replacement.reference,
+        )
+        self.save_mod_group(updated, action="手动匹配组员", rules=rules)
 
-    def save_mod_group(self, group, *, action=None):
+    def save_mod_group(self, group, *, action=None, rules=None):
         groups = [group if existing.id == group.id else existing for existing in self.profile.mod_groups]
         if group not in groups:
             groups.append(group)
-        updated = replace(self.profile, mod_groups=groups)
+        updated = replace(self.profile, mod_groups=groups, rules=self.profile.rules if rules is None else rules)
         try:
             parse_profile(profile_dict(updated))
         except (TypeError, ValueError) as exc:
@@ -1236,7 +1365,7 @@ class MainWindow(QMainWindow):
             unique.setdefault(member.reference, member)
         return tuple(unique.values())
 
-    def fill_group_menu(self, menu, members):
+    def fill_group_menu(self, menu, members, *, location=None):
         members = self.unique_group_members(members)
         menu.addAction("新建分组…", lambda: self.edit_mod_group(members=members))
         if self.profile.mod_groups:
@@ -1248,6 +1377,31 @@ class MainWindow(QMainWindow):
                 lambda _checked=False, identity=group.id: self.add_group_members(identity, members),
             )
             action.setEnabled(any(member.reference not in contains for member in members))
+        if location is None:
+            return
+        memberships = [
+            (group, row.entry.id) for group, rows in self.group_rows for row in rows
+            if row.target == location
+        ]
+        if memberships:
+            menu.addSeparator()
+            locate = menu.addMenu("在分组中定位")
+            remove = menu.addMenu("从分组移出")
+            for group, member_id in memberships:
+                locate.addAction(
+                    group.title,
+                    lambda _checked=False, identity=group.id, member=member_id:
+                    self.reveal_group_member(identity, member),
+                )
+                remove.addAction(
+                    group.title,
+                    lambda _checked=False, identity=group.id, member=member_id:
+                    self.remove_group_member(identity, member),
+                )
+
+    def reveal_group_member(self, group_id, member_id):
+        self.show_utility_page(self.utility.groups_page)
+        self.utility.group_shelf.reveal_member(group_id, member_id, focus=True)
 
     def add_group_members(self, identity, members):
         group = self.find_mod_group(identity)
@@ -1267,12 +1421,12 @@ class MainWindow(QMainWindow):
         self.fill_group_menu(menu, (member,))
         menu.popup(button.mapToGlobal(button.rect().bottomLeft()))
 
-    def remove_group_member(self, identity, reference):
+    def remove_group_member(self, identity, member_id):
         group = self.find_mod_group(identity)
         if group:
-            self.save_mod_group(replace(group, members=tuple(
-                member for member in group.members if member.reference != reference
-            )), action="移出分组")
+            members = tuple(member for member in group.members if member.id != member_id)
+            self.save_mod_group(replace(group, members=members, locked=group.locked and len(members) >= 2),
+                                action="移出分组")
 
     def delete_mod_group(self, identity):
         group = self.find_mod_group(identity)
@@ -1300,22 +1454,23 @@ class MainWindow(QMainWindow):
             if side == "profile":
                 if boundary is not None and not self.can_reorder_manually():
                     return
-                updated, skipped = enable_group(self.profile, group, resolve_entries(list(group.members), self.mods), boundary)
-                if len(updated.entries) + len(updated.staged) > MAX_ENTRIES:
-                    raise ValueError(f"计划和暂存合计最多 {MAX_ENTRIES} 项。")
-                self.edit_profile("整组加入计划", updated)
+                members = resolve_entries(list(group.members), self.mods)
+                if any(row.mod and row.mod.key in self.file_tool_keys for row in members):
+                    raise ValueError("分组包含已转入「游戏文件替换」的 Mod。请先在工具中将它移回普通列表。")
+                updated, skipped = enable_group(self.profile, group, members, boundary)
+                added = self.apply_activation("整组加入计划", updated)
                 message = f"「{group.title}」已按分组顺序加入计划 · {len(group.members) - skipped} 项。"
                 if skipped:
                     message += f" {skipped} 项未匹配本机安装，已跳过。"
+                if added:
+                    message += self.requirement_notice(added)
             elif side == "library":
                 members = members_in_plan(group, self.profile.entries)
                 check_complete_locks(self.profile, members.values())
-                staged_before = len(self.profile.staged)
-                self.remove_indices([self.plan_positions[entry.id] for entry in members.values()],
-                                    reveal_staged=False, action="整组移出计划")
+                if not self.remove_indices([self.plan_positions[entry.id] for entry in members.values()],
+                                           action="整组移出计划"):
+                    return
                 message = f"「{group.title}」已移出计划 · {len(members)} 项。"
-                if len(self.profile.staged) > staged_before:
-                    message += " 联锁成员已一起放入暂存。"
             else:
                 return
             self.statusBar().showMessage(message, 5500)
@@ -1365,81 +1520,139 @@ class MainWindow(QMainWindow):
     def open_mod_menu(self, side, data, point):
         plan = side == "profile"
         view = self.profile_list if plan else self.library_list
+        if "group" not in data:
+            location = ModLocation(side, data["entry_id"] if plan else data["value"])
+            selected = [self.item_location(side, item) for item in sorted(view.selectedItems(), key=view.row)]
+            self.show_mod_context_menu(view, point, side, location, selected)
+            return
+
         menu = QMenu(view)
         menu.setObjectName("modContextMenu")
         menu.aboutToHide.connect(menu.deleteLater)
-        if "group" in data:
-            menu.addAction("编辑分组标题…", lambda: self.edit_group_at(data["value"]))
-            group, end = self.groups_by_index()[data["value"]]
-            members = self.unique_group_members(self.profile.entries[data["value"]:end])
-            menu.addAction("存为可拖动分组…", lambda: self.edit_mod_group(members=members, name=group.title))
-        else:
-            location = ModLocation(side, data["entry_id"] if plan else data["value"])
-            self.inspect_selection(location)
-            clicked_mod, clicked_row = self.location_details(location)
-            selected = self.selected_profile_indices() if plan else []
-            indices = expand_selection(self.plan_units, selected) if plan else []
-            mods = (
-                tuple(dict.fromkeys(self.resolved[i].mod for i in selected if self.resolved[i].mod))
-                if plan else tuple(self.mods_by_key[key] for key in self.selected_library_keys())
-            )
-            if plan and len(selected) == 1:
-                mods = (clicked_mod,) if clicked_mod else ()
-            members = ([self.profile.entries[index] for index in indices] if plan
-                       else [ProfileEntry.from_mod(mod, pinned=True) for mod in mods])
-            if members:
-                self.fill_group_menu(menu.addMenu("分组管理"), members)
-            if mods:
-                if self.tags:
-                    menu.addAction(
-                        "编辑标签…" if len(mods) == 1 else "批量添加标签…",
-                        lambda: self.change_tags(mods, append=len(mods) > 1),
-                    )
-                colors = menu.addMenu("标记颜色")
-                for title, color in MARK_COLORS:
-                    colors.addAction(icon("dot", color), title, lambda _checked=False, color=color: self.mark_mods(mods, color))
-                colors.addAction("清除颜色", lambda: self.mark_mods(mods, ""))
-                menu.addAction("修改类型…", lambda: self.change_classification(mods))
-            if plan:
-                self.add_plan_menu_actions(menu, data, indices)
-            else:
-                menu.addSeparator()
-                menu.addAction("加入计划", self.add_selected)
-                menu.addAction("移入暂存篮", self.stage_available)
-            identifier = workshop_id(clicked_mod.workshop_id if clicked_mod else None) or workshop_id(
-                clicked_row.entry.workshop_id if clicked_row else None
-            )
-            menu.addSeparator()
-            if clicked_mod:
-                menu.addAction("别名与中文简介…", lambda: self.edit_mod_text(clicked_mod))
-                menu.addAction("打开 Mod 文件夹", lambda: self.open_mod_folder(mod=clicked_mod))
-            if plan:
-                menu.addAction("匹配此 Mod…", lambda: self.relink_plan_entry(location.identity))
-            if identifier:
-                menu.addAction("打开创意工坊", lambda: self.open_workshop(identifier=identifier))
-                self.add_workshop_menu_actions(menu, identifier=identifier)
+        menu.addAction("编辑分组标题…", lambda: self.edit_group_at(data["value"]))
+        group, end = self.groups_by_index()[data["value"]]
+        members = self.unique_group_members(self.profile.entries[data["value"]:end])
+        menu.addAction("存为可拖动分组…", lambda: self.edit_mod_group(members=members, name=group.title))
         menu.popup(point)
 
-    def add_plan_menu_actions(self, menu, data, indices):
-        menu.addAction("添加或编辑分组标题…", lambda: self.edit_group_at(indices[0]))
-        reference = self.profile.entries[data["value"]].reference
-        menu.addAction("添加排序规则…", lambda: self.edit_rules(first=reference))
-        menu.addSeparator()
-        locking = menu.addAction(icon("link"), "联锁选中项", lambda: self.lock_selected(quick=True))
+    def configure_context_menu(self, scope="library"):
+        dialog = ModMenuDialog(self.settings, self, scope=scope)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            updated = replace(
+                self.settings, mod_menu_mode=dialog.mode.currentData(), mod_menu_items=dialog.result_items(),
+            )
+            try:
+                updated.save(self.data_dir)
+            except (OSError, ValueError) as exc:
+                self.error("无法保存右键菜单", str(exc))
+            else:
+                self.settings = updated
+        dialog.deleteLater()
+
+    def show_feature_guide(self):
+        dialog = FeatureGuideDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def show_mod_context_menu(self, view, point, scope, location, selected, *, extra=None):
+        if not self.location_exists(location):
+            return
+        self.inspect_selection(location)
+        commands = self.mod_menu_commands(location, selected)
+        if extra:
+            commands.update(extra)
+        popup_mod_menu(view, point, scope, commands, self.settings, self.configure_context_menu)
+
+    def mod_menu_commands(self, location, selected):
+        clicked_mod, clicked_row = self.location_details(location)
+        selected = tuple(dict.fromkeys((*selected, location))) if location in selected else (location,)
+        selected = tuple(target for target in selected if target.side == location.side and self.location_exists(target))
+        plan = location.side == "profile"
+        indices = sorted(self.plan_positions[target.identity] for target in selected) if plan else []
+        mods = tuple(dict.fromkeys(mod for target in selected if (mod := self.location_details(target)[0])))
+        members = ([self.profile.entries[i] for i in expand_selection(self.plan_units, indices)] if plan
+                   else [ProfileEntry.from_mod(mod, pinned=True) for mod in mods])
+        reference = clicked_row.entry.reference if clicked_row else clicked_mod.reference
+        commands = {
+            "rule": MenuCommand(lambda: self.edit_rules(first=reference)),
+            "requires": MenuCommand(lambda: self.edit_rules(first=reference, prerequisite=True)),
+            "relations": MenuCommand(lambda: self.reveal_mod_relations(location)),
+        }
+        if members:
+            commands["group"] = MenuCommand(
+                submenu=lambda menu: self.fill_group_menu(menu, members, location=location),
+            )
+        if mods:
+            if self.tags:
+                commands["tags"] = MenuCommand(
+                    lambda: self.change_tags(mods, append=len(mods) > 1),
+                    title="批量添加标签…" if len(mods) > 1 else "",
+                )
+            commands["color"] = MenuCommand(submenu=lambda menu: self.fill_color_menu(menu, mods))
+            commands["type"] = MenuCommand(lambda: self.change_classification(mods))
+        if plan:
+            commands.update(self.plan_menu_commands(location.identity, indices))
+        elif mods:
+            keys = [mod.key for mod in mods]
+            commands["add"] = MenuCommand(lambda: self.add_keys(keys))
+            commands["add_lock"] = MenuCommand(
+                lambda: self.add_keys(keys, arrangement="lock"), enabled=len(keys) > 1, glyph="link",
+            )
+            commands["add_heading"] = MenuCommand(lambda: self.add_keys(keys, arrangement="heading"))
+            if clicked_mod and (any(row.mod is None for row in self.resolved) or self.group_entries):
+                commands["match_pending"] = MenuCommand(lambda: self.match_pending_to_mod(clicked_mod))
+
+        identifier = self.workshop_identifier(clicked_mod, clicked_row.entry if clicked_row else None)
+        if clicked_mod:
+            commands["edit_text"] = MenuCommand(lambda: self.edit_mod_text(clicked_mod))
+            commands["folder"] = MenuCommand(lambda: self.open_mod_folder(mod=clicked_mod))
+            if clicked_mod.warnings:
+                commands["scan_notice"] = MenuCommand(lambda: self.show_mod_scan_notice(clicked_mod))
+            if clicked_mod.source == Source.LOCAL:
+                if not workshop_id(clicked_mod.workshop_id):
+                    commands["workshop_link"] = MenuCommand(lambda: self.associate_workshop(clicked_mod))
+                commands["uninstall"] = MenuCommand(lambda: self.uninstall_local_mod(clicked_mod))
+            elif clicked_mod.workshop_id:
+                commands["unsubscribe"] = MenuCommand(lambda: self.open_workshop(identifier=clicked_mod.workshop_id))
+            if clicked_mod.key not in self.file_tool_keys:
+                commands["replace_files"] = MenuCommand(lambda: self.open_file_replacements(mod=clicked_mod))
+            commands["exclude"] = MenuCommand(lambda: self.exclude_scan_mod(clicked_mod))
+        if identifier:
+            commands["workshop"] = MenuCommand(lambda: self.open_workshop(identifier=identifier))
+            commands["workshop_browser"] = MenuCommand(lambda: self.open_workshop(identifier=identifier, browser=True))
+            commands["workshop_copy"] = MenuCommand(lambda: self.copy_workshop_link(identifier=identifier))
+        return commands
+
+    def reveal_mod_relations(self, location):
+        if self.location_exists(location):
+            self.inspect_selection(location)
+            self.follow_current_detail()
+
+    def show_mod_scan_notice(self, mod):
+        self.show_text("Mod 扫描提示", "\n".join((mod.name, mod.path, "", *mod.warnings)))
+
+    def fill_color_menu(self, menu, mods):
+        for title, color in MARK_COLORS:
+            menu.addAction(icon("dot", color), title, lambda _checked=False, color=color: self.mark_mods(mods, color))
+        menu.addAction("清除颜色", lambda: self.mark_mods(mods, ""))
+
+    def plan_menu_commands(self, entry_id, indices):
         members = {self.profile.entries[i].id for i in indices}
         locked = bool(members.intersection(self.lock_by_entry))
-        locking.setEnabled(
+        lockable = (
             len(indices) >= 2 and not locked
             and (self.plan_is_filtered() or not self.profile_list.reorder_blocked)
         )
-        unlocking = menu.addAction("解除联锁", self.unlock_selected)
-        unlocking.setEnabled(locked)
-        if data["entry_id"] in self.problem_levels:
-            menu.addSeparator()
-            menu.addAction("看看这个 Mod 有什么问题", lambda: self.inspect_problem(data["entry_id"]))
-        menu.addSeparator()
-        menu.addAction("移入暂存篮", self.stage_plan)
-        menu.addAction("移出计划", self.remove_selected)
+        commands = {
+            "heading": MenuCommand(lambda: self.edit_group_at(self.plan_positions[entry_id])),
+            "lock": MenuCommand(lambda: self.lock_selected(quick=True, indices=indices), enabled=lockable, glyph="link"),
+            "unlock": MenuCommand(lambda: self.unlock_selected(indices=indices), enabled=locked),
+            "relink": MenuCommand(lambda: self.relink_plan_entry(entry_id)),
+            "remove": MenuCommand(lambda: self.remove_indices(indices)),
+        }
+        if entry_id in self.problem_levels:
+            commands["problem"] = MenuCommand(lambda: self.inspect_problem(entry_id))
+        return commands
 
     def add_selected(self):
         self.add_keys(self.selected_library_keys())
@@ -1456,23 +1669,63 @@ class MainWindow(QMainWindow):
             if record.target in self.matching_targets["library"]
         ])
 
-    def add_keys(self, keys, target=None):
+    def add_keys(self, keys, target=None, *, arrangement=""):
         entries = self.new_entries(keys)
-        if entries:
-            target = len(self.profile.entries) if target is None else snap_boundary(self.plan_units, target)
-            current = self.profile.entries
-            self.edit_profile("加入 Mod", replace(self.profile, entries=current[:target] + entries + current[target:]))
+        if not entries:
+            return
+        target = len(self.profile.entries) if target is None else snap_boundary(self.plan_units, target)
+        current = self.profile.entries
+        updated = replace(self.profile, entries=current[:target] + entries + current[target:])
+        action = "加入 Mod"
+        anchor = entries[0]
+        if arrangement == "lock":
+            if len(entries) < 2:
+                self.statusBar().showMessage("选中至少两个可用 Mod 后可一起联锁。", 4500)
+                return
+            lock = ProfileLock(self.lock_title(anchor, len(entries)), tuple(entry.id for entry in entries))
+            updated.locks = [*updated.locks, lock]
+            action = "加入计划并联锁"
+        elif arrangement == "heading":
+            title, accepted = QInputDialog.getText(self, "加入计划并设标题", "计划分组标题", text=anchor.name[:120])
+            if not accepted or not title.strip():
+                return
+            if len(title.strip()) > 120:
+                self.error("分组名称过长", "请输入 120 字以内的组名。")
+                return
+            updated.groups = [*updated.groups, ProfileGroup(anchor.id, title.strip())]
+            action = "加入计划并设标题"
+        try:
+            added = self.apply_activation(action, updated)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 6500)
+            return
+        if arrangement == "lock":
+            self.profile_list.flash_lock(anchor.id)
+        if arrangement or added:
+            self.statusBar().showMessage(f"已{action}。{self.requirement_notice(added) if added else ''}", 5500)
+
+    def apply_activation(self, action, updated, *, roots=()):
+        previous = {entry.reference for entry in self.profile.entries}
+        added_refs = (entry.reference for entry in updated.entries if entry.reference not in previous)
+        updated, added = enable_requirements(updated, (*roots, *added_refs), self.mods, self.file_tool_keys)
+        if len(updated.entries) > MAX_ENTRIES:
+            raise ValueError(f"计划最多 {MAX_ENTRIES} 项。")
+        self.edit_profile(action, updated)
+        return added
+
+    @staticmethod
+    def requirement_notice(added):
+        names = "、".join(entry.name for entry in added[:5])
+        more = f"等 {len(added)} 项" if len(added) > 5 else ""
+        return f" 已同时启用前置「{names}」{more}。"
 
     def new_entries(self, keys):
-        used = {entry.mod.key for entry in self.resolved if entry.mod} | self.staged_keys.keys()
+        used = {entry.mod.key for entry in self.resolved if entry.mod}
         entries = []
         for key in dict.fromkeys(key for key in keys if isinstance(key, str)):
-            if key in self.mods_by_key and key not in used:
+            if key in self.mods_by_key and key not in used and key not in self.file_tool_keys:
                 entries.append(ProfileEntry.from_mod(self.mods_by_key[key]))
                 used.add(key)
-        if len(self.profile.entries) + len(self.profile.staged) + len(entries) > MAX_ENTRIES:
-            self.statusBar().showMessage(f"计划和暂存合计最多 {MAX_ENTRIES} 项。", 5000)
-            return []
         return entries
 
     def selected_profile_indices(self):
@@ -1481,91 +1734,37 @@ class MainWindow(QMainWindow):
     def remove_selected(self):
         self.remove_indices(self.selected_profile_indices())
 
-    def remove_indices(self, indices, *, stage=False, reveal_staged=True, action=None):
+    def remove_indices(self, indices, *, action=None):
         indices = expand_selection(self.plan_units, indices)
         if not indices:
-            return
+            return False
         entries = self.profile.entries
-        staged = [entries[i] for i in indices if stage or entries[i].id in self.lock_by_entry]
+        removed = {entries[i].id for i in indices}
+        try:
+            check_removal(self.profile, removed)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 6500)
+            return False
+        locks = [lock for lock in self.profile.locks if not removed.isdisjoint(lock.members)]
         selected = set(indices)
         groups = []
         for index, (group, end) in self.groups_by_index().items():
             retained = next((i for i in range(index, end) if i not in selected), None)
             if retained is not None:
                 groups.append(ProfileGroup(entries[retained].id, group.title))
-        self.edit_profile(action or ("暂存 Mod" if stage else "移出计划"), replace(
+        updated = replace(
             self.profile, groups=groups, entries=[entry for i, entry in enumerate(entries) if i not in selected],
-            staged=self.profile.staged + staged,
-        ))
-        if staged and reveal_staged:
-            self.show_stage({entry.id for entry in staged})
-            self.statusBar().showMessage(f"{len(staged)} 项已移入暂存篮。保存方案后保留。", 4500)
+            locks=[lock for lock in self.profile.locks if lock not in locks],
+            mod_groups=groups_for_disabled_locks(self.profile, locks, entries),
+        )
+        self.edit_profile(action or "移出计划", updated)
+        if locks:
+            self.show_utility_page(self.utility.groups_page)
+            self.statusBar().showMessage("联锁组已停用，可以从分组重新启用。", 4500)
+        return True
 
-    def stage_available(self):
-        selected = self.selected_library_keys()
-        if not selected:
-            self.statusBar().showMessage("请从可用列表选中要暂存的 Mod。", 4000)
-            return
-        entries = self.new_entries(selected)
-        if entries:
-            self.edit_profile("暂存 Mod", replace(self.profile, staged=self.profile.staged + entries))
-            self.show_stage({entry.id for entry in entries})
-
-    def stage_plan(self):
-        self.remove_indices(self.selected_profile_indices(), stage=True)
-
-    def stage_members(self):
-        return {member for item in self.utility.staging.selectedItems() for member in item.data(ROLE)}
-
-    def show_stage(self, selected):
-        self.show_utility_page(self.utility.stage_page)
-        staging = self.utility.staging
-        first = None
-        with QSignalBlocker(staging):
-            for index in range(staging.count()):
-                item = staging.item(index)
-                matched = bool(selected.intersection(item.data(ROLE)))
-                item.setSelected(matched)
-                if matched and first is None:
-                    first = item
-        if first is not None:
-            staging.setCurrentItem(first, QItemSelectionModel.SelectionFlag.NoUpdate)
-            staging.scrollToItem(first, QAbstractItemView.ScrollHint.EnsureVisible)
-        self.utility.update_stage_buttons()
-
-    def add_staged(self):
-        members = self.stage_members()
-        if not members:
-            return
-        entries = [row for row in self.staged_resolved if row.entry.id in members]
-        used_keys = {row.mod.key for row in self.resolved if row.mod}
-        for row in entries:
-            if row.mod and row.mod.key in used_keys:
-                self.statusBar().showMessage(f"{row.entry.name} 已在计划中。请先处理重复项。", 5000)
-                return
-            if row.mod:
-                used_keys.add(row.mod.key)
-        start = len(self.profile.entries)
-        self.edit_profile("从暂存加入计划", replace(
-            self.profile, entries=self.profile.entries + [row.entry for row in entries],
-            staged=[entry for entry in self.profile.staged if entry.id not in members],
-        ))
-        self.reveal_entry(start)
-        self.statusBar().showMessage(f"已按暂存顺序将 {len(entries)} 项加入计划末尾。", 5000)
-
-    def release_staged(self):
-        members = self.stage_members()
-        if not members:
-            return
-        if members.intersection(self.lock_by_entry):
-            self.statusBar().showMessage("请先解除选中项的联锁，再移回可用库。", 5000)
-            return
-        self.edit_profile("从暂存移回可用库", replace(
-            self.profile, staged=[entry for entry in self.profile.staged if entry.id not in members],
-        ))
-
-    def lock_selected(self, *, quick=False):
-        indices = self.selected_profile_indices()
+    def lock_selected(self, *, quick=False, indices=None):
+        indices = self.selected_profile_indices() if indices is None else indices
         if len(indices) < 2:
             self.statusBar().showMessage("在计划列表中至少选中两个 Mod。", 4500)
             return
@@ -1578,7 +1777,7 @@ class MainWindow(QMainWindow):
         if not filtered and not self.can_reorder_manually():
             return
         start = indices[0]
-        title = f"{entries[start].name[:102]} · {len(indices)} 项"
+        title = self.lock_title(entries[start], len(indices))
         ordered = move_entries(entries, indices, start)
         if (quick or filtered) and ordered != entries:
             previous = {entry.id: i for i, entry in enumerate(entries, 1)}
@@ -1610,15 +1809,27 @@ class MainWindow(QMainWindow):
         if not quick:
             self.show_utility_page(self.utility.groups_page)
 
-    def unlock_selected(self, *, staged=False):
-        members = self.stage_members() if staged else {
-            self.profile.entries[index].id for index in self.selected_profile_indices()
+    @staticmethod
+    def lock_title(entry, count):
+        return f"{entry.name[:102]} · {count} 项"
+
+    def unlock_selected(self, *, indices=None):
+        members = {
+            self.profile.entries[index].id
+            for index in (self.selected_profile_indices() if indices is None else indices)
         }
         remaining = [lock for lock in self.profile.locks if not members.intersection(lock.members)]
         if remaining == self.profile.locks:
             self.statusBar().showMessage("选中一个联锁内的条目即可解除整组联锁。", 4500)
             return
-        self.edit_profile("解除联锁", replace(self.profile, locks=remaining))
+        unlocked = {identity for lock in self.profile.locks if lock not in remaining for identity in lock.members}
+        groups = [
+            replace(group, locked=False) if group.locked and
+            all(member.id in unlocked for member in group.members) and
+            len({member.reference for member in group.members}) == len(group.members) else group
+            for group in self.profile.mod_groups
+        ]
+        self.edit_profile("解除联锁", replace(self.profile, locks=remaining, mod_groups=groups))
         self.statusBar().showMessage("已解除联锁。每个 Mod 可以单独移动。", 4500)
 
     def handle_drop(self, side, payload, boundary):
@@ -1627,6 +1838,10 @@ class MainWindow(QMainWindow):
         if payload.get("side") == "group":
             if payload.get("profile_id") == self.profile.id and isinstance(payload.get("group_id"), str):
                 self.apply_mod_group(payload["group_id"], side, boundary if side == "profile" else None)
+            return
+        if payload.get("side") == "group-member":
+            if payload.get("profile_id") == self.profile.id:
+                self.drop_group_member(side, payload.get("group_id"), payload.get("member_id"), boundary)
             return
         if not isinstance(payload.get("values"), list):
             return
@@ -1639,11 +1854,35 @@ class MainWindow(QMainWindow):
             if payload.get("side") == "library":
                 self.add_keys(values, target=boundary)
             elif payload.get("side") == "profile":
-                indices = expand_selection(self.plan_units, [i for i in values if isinstance(i, int)])
-                ordered = move_entries(
-                    self.profile.entries, indices, snap_boundary(self.plan_units, boundary)
-                )
-                self.edit_profile("移动 Mod", replace(self.profile, entries=ordered))
+                self.move_plan_entries([i for i in values if isinstance(i, int)], boundary)
+
+    def move_plan_entries(self, indices, boundary):
+        indices = expand_selection(self.plan_units, indices)
+        ordered = move_entries(self.profile.entries, indices, snap_boundary(self.plan_units, boundary))
+        self.edit_profile("移动 Mod", replace(self.profile, entries=ordered))
+
+    def drop_group_member(self, side, group_id, member_id, boundary):
+        for group, rows in self.group_rows:
+            if group.id != group_id:
+                continue
+            for row in rows:
+                if row.entry.id != member_id:
+                    continue
+                target = row.target
+                if side == "profile" and self.can_reorder_manually():
+                    if target.side == "profile":
+                        self.move_plan_entries([self.plan_positions[target.identity]], boundary)
+                    elif target.side == "library":
+                        if group.locked:
+                            self.apply_mod_group(group.id, side, boundary)
+                        else:
+                            self.add_keys([target.identity], target=boundary)
+                    else:
+                        self.statusBar().showMessage("请先匹配组员，再把它拖入计划。", 5000)
+                elif side == "library" and target.side == "profile":
+                    self.remove_indices([self.plan_positions[target.identity]])
+                return
+            return
 
     def nudge(self, direction):
         if not self.can_reorder_manually():
@@ -1679,36 +1918,75 @@ class MainWindow(QMainWindow):
         previous = self.profile.entries[index]
         if not (mod := self.choose_installed_mod(previous)):
             return
-        if mod.key in self.staged_keys:
-            self.show_stage({self.staged_keys[mod.key]})
-            self.statusBar().showMessage("此 Mod 在暂存篮中。移出暂存后可用于匹配。", 5500)
+        if mod.key in self.file_tool_keys:
+            self.statusBar().showMessage("此 Mod 已转入「游戏文件替换」。", 5500)
             return
-        updated = replace(ProfileEntry.from_mod(mod, pinned=True), id=previous.id)
-        rules, groups, disabled = self.profile.rules, self.profile.mod_groups, 0
-        if sum(entry.reference == previous.reference for entry in self.profile.entries + self.profile.staged) == 1:
-            rules = []
-            for rule in self.profile.rules:
-                retargeted = replace(
-                    rule,
-                    first=updated.reference if rule.first == previous.reference else rule.first,
-                    second=updated.reference if rule.second == previous.reference else rule.second,
-                )
-                if retargeted.first == retargeted.second:
-                    rules.append(replace(rule, enabled=False))
-                    disabled += 1
-                else:
-                    rules.append(retargeted)
-            groups = [
-                replace(group, members=self.unique_group_members(
-                    replace(updated, id=member.id) if member.reference == previous.reference else member
+        if any(row.mod and row.mod.key == mod.key and row.entry.id != previous.id for row in self.resolved):
+            self.statusBar().showMessage("此安装已在计划中，请选择另一份。", 5500)
+            return
+        try:
+            self.replace_plan_mod(previous.id, mod, "手动定位 Mod")
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 6500)
+
+    def match_pending_to_mod(self, mod):
+        if mod.key not in self.available_keys:
+            return
+        records = [record for record in self.search_records["profile"]
+                   if self.resolved[self.plan_positions[record.target.identity]].mod is None]
+        records += self.search_records["group"]
+        if not records:
+            return
+        picker = GlobalSearchDialog(records, self, pick_mod=True)
+        picker.setWindowTitle(f"用「{mod.name}」匹配待定位条目")
+        accepted = picker.exec() == QDialog.DialogCode.Accepted
+        target = picker.target
+        picker.deleteLater()
+        if not accepted or not target or not self.location_exists(target):
+            return
+        if target.side == "group":
+            group_id, member_id = target.identity.split(":", 1)
+            self.relink_group_member(group_id, member_id, mod=mod)
+            return
+        try:
+            self.replace_plan_mod(target.identity, mod, "匹配待定位条目")
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 6500)
+        else:
+            self.navigate(target, focus=False)
+
+    def replace_plan_mod(self, identity, mod, action):
+        index = self.plan_positions[identity]
+        original = self.profile.entries[index]
+        updated = replace(ProfileEntry.from_mod(mod, pinned=True), id=identity)
+        rules, groups = self.profile.rules, self.profile.mod_groups
+        if sum(entry.reference == original.reference for entry in self.profile.entries) == 1:
+            rules = self.retarget_rules(rules, original.reference, updated.reference)
+            groups = []
+            for group in self.profile.mod_groups:
+                members = tuple(
+                    replace(updated, id=member.id) if member.reference == original.reference else member
                     for member in group.members
-                )) for group in self.profile.mod_groups
-            ]
+                )
+                if not group.locked:
+                    members = self.unique_group_members(members)
+                groups.append(replace(group, members=members))
         entries = self.profile.entries.copy()
         entries[index] = updated
-        self.edit_profile("手动定位 Mod", replace(self.profile, entries=entries, rules=rules, mod_groups=groups))
-        if disabled:
-            self.statusBar().showMessage(f"已停用 {disabled} 条指向同一 Mod 的规则。", 5000)
+        return self.apply_activation(action, replace(self.profile, entries=entries, rules=rules,
+                                                     mod_groups=groups))
+
+    @staticmethod
+    def retarget_rules(rules, before, after):
+        output = []
+        for rule in rules:
+            first = after if rule.first == before else rule.first
+            second = after if rule.second == before else rule.second
+            if first != second:
+                output.append(replace(rule, first=first, second=second))
+            elif rule.kind != "requires":
+                output.append(replace(rule, enabled=False))
+        return list(dict.fromkeys(output))
 
     def choose_installed_mod(self, entry: ProfileEntry) -> Mod | None:
         if not self.mods:
@@ -1757,7 +2035,7 @@ class MainWindow(QMainWindow):
 
     def rule_search_targets(self) -> dict[str, SearchRecord]:
         by_reference = defaultdict(list)
-        for side in ("profile", "staging", "library"):
+        for side in ("profile", "library", "group"):
             for record in self.search_records[side]:
                 mod, row = self.location_details(record.target)
                 reference = row.entry.reference if row else mod.reference
@@ -1795,10 +2073,27 @@ class MainWindow(QMainWindow):
             )
         return targets
 
-    def edit_rules(self, *, first="", second=""):
-        dialog = RuleDialog(self.profile.rules, self.rule_search_targets(), self, first=first, second=second)
+    def edit_rules(self, *, first="", second="", prerequisite=False):
+        targets = self.rule_search_targets()
+        dialog = RuleDialog(
+            self.profile.rules, targets, self, first=first, second=second, prerequisite=prerequisite,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.edit_profile("编辑排序规则", replace(self.profile, rules=dialog.result_rules()))
+            rules = dialog.result_rules()
+            old = required_edges(self.profile.rules)
+            changed = dict.fromkeys(rule.first for rule in rules if rule.kind == "requires" and rule.enabled
+                                    and rule.second not in old.get(rule.first, ()))
+            active = {entry.reference for entry in self.profile.entries}
+            try:
+                required_mods(rules, changed, {key: target.title for key, target in targets.items()})
+                added = self.apply_activation(
+                    "编辑排序规则", replace(self.profile, rules=rules),
+                    roots=tuple(reference for reference in changed if reference in active),
+                )
+                if added:
+                    self.statusBar().showMessage(self.requirement_notice(added), 5500)
+            except ValueError as exc:
+                self.statusBar().showMessage(str(exc), 7500)
 
     def edit_conflict_rule(self, first_id, second_id):
         if first_id in self.plan_positions and second_id in self.plan_positions:
@@ -1911,7 +2206,8 @@ class MainWindow(QMainWindow):
         self.refresh_history_panel()
         if result != QDialog.DialogCode.Accepted or not dialog.restored:
             return
-        if profile_dict(dialog.restored) == profile_dict(self.profile):
+        restored = replace(dialog.restored, name=self.profile.name)
+        if profile_dict(restored) == profile_dict(self.profile):
             return
         try:
             self.history.capture(self.profile, "恢复快照前")
@@ -1919,12 +2215,12 @@ class MainWindow(QMainWindow):
             self.error("无法保存恢复前快照", str(exc))
             return
         self.collapsed_groups.clear()
-        self.edit_profile("载入历史快照", dialog.restored)
+        self.edit_profile("载入历史快照", restored)
         self.refresh_history_panel()
         self.statusBar().showMessage("已载入快照。保存方案后保留。", 4500)
 
     def show_utility_page(self, page):
-        if self.utility.isHidden():
+        if not self.panes.sizes()[3]:
             self.toggle_utility()
         self.utility.tabs.setCurrentWidget(page)
 
@@ -2118,12 +2414,28 @@ class MainWindow(QMainWindow):
             return
         dialog = CampaignDialog(
             self.data_dir, targets, self.profile.name, self.resolved, self.mods, parent or self,
+            rules=self.profile.rules, launch_preferences=self.settings.campaign_launch_options,
+            steam_roots=self.settings.steam_paths,
         )
         started = dialog.process if dialog.exec() == QDialog.DialogCode.Accepted else None
+        preference = dialog.launch_preference
         dialog.deleteLater()
         if started is not None:
             self._launched_game = started
-            self.statusBar().showMessage("已启动游戏 · 请在主菜单选择空档位或刚建的新档。", 12000)
+            message = "已启动游戏 · 请在主菜单选择空档位或刚建的新档。"
+            if preference:
+                path, options = preference
+                if self.settings.campaign_launch_options.get(path) != options:
+                    updated = replace(self.settings, campaign_launch_options={
+                        **self.settings.campaign_launch_options, path: options,
+                    })
+                    try:
+                        updated.save(self.data_dir)
+                    except (OSError, ValueError) as exc:
+                        message += f" 启动项未能保存：{exc}"
+                    else:
+                        self.settings = updated
+            self.statusBar().showMessage(message, 12000)
             QTimer.singleShot(2500, self, self.check_game_start)
 
     def check_game_start(self):
@@ -2257,17 +2569,82 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as exc:
                 self.error("复制方案失败", str(exc))
 
-    def import_profile(self):
-        if not self.maybe_save():
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "导入 DarkSort 配置", "", "DarkSort 配置 (*.json)"
-        )
+    def manage_profiles(self):
+        dialog = ProfileManagerDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def rename_profile(self, profile_id: str, name: str):
+        renamed = self.store.rename(profile_id, name)
+        self.populate_profiles()
+        if self.profile.id == profile_id:
+            self.profile = replace(self.profile, name=renamed.name)
+            self._baseline["name"] = renamed.name
+            self.render_lists()
+        self.statusBar().showMessage(f"方案名称已保存为「{renamed.name}」。", 4000)
+
+    def delete_profile(self, profile_id: str):
+        deleting_current = self.profile.id == profile_id
+        replacement = None
+        if deleting_current:
+            profiles, _ = self.store.list()
+            replacement = next((profile for profile in profiles if profile.id != profile_id), None)
+        archived = self.store.archive(profile_id)
+        created = None
+        try:
+            if deleting_current and replacement is None:
+                replacement = created = self.store.new(DEFAULT_PROFILE_NAME)
+            self.save_bindings.remove_profile(profile_id)
+        except (OSError, TypeError, ValueError):
+            archived.rename(self.store.path(profile_id))
+            if created:
+                self.store.path(created.id).unlink()
+            raise
+        if deleting_current:
+            self.activate_profile(replacement)
+        else:
+            self.populate_profiles()
+        self.statusBar().showMessage("方案已删除，已保存版本留在数据目录的 deleted-profiles 中。", 5500)
+
+    def import_profile(self, *, share=False):
+        title = "导入方案分享包" if share else "导入 DarkSort 方案"
+        file_filter = "DarkSort 分享包 (*.zip)" if share else "DarkSort 方案 (*.json)"
+        path, _ = QFileDialog.getOpenFileName(self, title, "", file_filter)
         if not path:
             return
         try:
-            self.activate_profile(self.store.import_file(Path(path)))
-            self.statusBar().showMessage("已导入为独立配置；待定位条目将保留原顺序。", 5000)
+            source = Path(path)
+            profile = read_share_package(source) if share else read_profile_file(source)
+            existing, _ = self.store.list()
+            current_refs = {entry.reference for entry in profile.entries}
+            group_only = self.unique_group_members(
+                entry for group in profile.mod_groups for entry in group.members if entry.reference not in current_refs
+            )
+            sections = [("计划", profile.entries), ("仅在分组中", group_only)]
+            matches = transfer_matches(self.mods, sections, self.discovery is not None)
+            summary = [f"{len(profile.entries)} 个计划 Mod"]
+            if profile.mod_groups or profile.locks or profile.rules:
+                summary.append(f"{len(profile.mod_groups)} 个分组 · {len(profile.locks)} 组联锁 · {len(profile.rules)} 条规则")
+            lead = (profile.entries or group_only)[:5]
+            if lead:
+                heading = "计划开头" if profile.entries else "分组中的 Mod"
+                lines = [
+                    f"{index:02d}  {self.display_name(entry.reference, entry.name)}"
+                    for index, entry in enumerate(lead, 1)
+                ]
+                summary.append("\n".join([heading, *lines]))
+            summary.append(matches)
+            if share and any(
+                key.startswith(("tag:", "color:")) for rule in profile.rules for key in (rule.first, rule.second)
+            ):
+                summary.append("标签和标记颜色规则会按本机标记重新计算。")
+            dialog = ProfileImportDialog(source, profile, [item.name for item in existing], "\n\n".join(summary), self)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            name = dialog.name.text().strip()
+            dialog.deleteLater()
+            if accepted and self.maybe_save():
+                self.activate_profile(self.store.import_profile(replace(profile, name=name)))
+                self.statusBar().showMessage(f"已导入「{name}」。待匹配条目会保留原位置。", 5000)
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             self.error("导入失败", str(exc))
 
@@ -2316,33 +2693,7 @@ class MainWindow(QMainWindow):
             self.error("无法生成分享包", str(exc))
 
     def import_share_package(self):
-        path, _ = QFileDialog.getOpenFileName(self, "导入方案分享包", "", "DarkSort 分享包 (*.zip)")
-        if not path:
-            return
-        try:
-            profile = read_share_package(Path(path))
-            existing, _ = self.store.list()
-            profile = replace(profile, name=unique_title(profile.name, (plan.name for plan in existing)))
-            current_refs = {entry.reference for entry in profile.entries + profile.staged}
-            group_only = self.unique_group_members(
-                entry for group in profile.mod_groups for entry in group.members if entry.reference not in current_refs
-            )
-            sections = [("计划", profile.entries), ("暂存", profile.staged), ("仅在分组中", group_only)]
-            matches = transfer_matches(self.mods, sections, self.discovery is not None)
-            note = ""
-            if any(key.startswith(("tag:", "color:")) for rule in profile.rules for key in (rule.first, rule.second)):
-                note = "\n标签和标记颜色规则会按本机标记重新计算。"
-            if not confirmation_dialog(
-                self, "导入方案分享包",
-                f"将建立独立方案「{profile.name}」，保留原有顺序。\n"
-                f"{len(profile.mod_groups)} 个分组 · {len(profile.locks)} 组联锁 · {len(profile.rules)} 条规则"
-                f"{note}\n\n{matches}", "导入为新方案",
-            ) or not self.maybe_save():
-                return
-            self.activate_profile(self.store.import_profile(profile))
-            self.statusBar().showMessage("已导入为独立方案。待匹配条目会保留原位置。", 5000)
-        except (OSError, ValueError, TypeError, AttributeError) as exc:
-            self.error("无法导入分享包", str(exc))
+        self.import_profile(share=True)
 
     def edit_paths(self):
         dialog = PathDialog(self.settings, self.discovery, self)
@@ -2354,6 +2705,212 @@ class MainWindow(QMainWindow):
                 self.start_scan()
             except OSError as exc:
                 self.error("路径保存失败", str(exc))
+
+    def install_parents(self):
+        games = self.game_locations() or discover(self.settings).games
+        parents = []
+        for game in games:
+            try:
+                parent = mod_parent(game)
+            except (OSError, ValueError):
+                continue
+            if parent not in parents:
+                parents.append(parent)
+        return parents
+
+    def local_scan_settings(self, parent):
+        excluded = {Path(path).expanduser().resolve() for path in self.settings.excluded_paths if path}
+        if parent in excluded or not excluded.isdisjoint(parent.parents):
+            raise ValueError("此目录已排除扫描。请在「工具 → 扫描路径」恢复后再创建本地 Mod。")
+        custom = self.settings.local_paths
+        if custom and parent not in {Path(path).expanduser().resolve() for path in custom if path}:
+            return replace(self.settings, local_paths=[*custom, str(parent)])
+        return self.settings
+
+    def create_empty_mod(self):
+        manual = self.data_dir.resolve() / "manual-tools"
+        dialog = NewModDialog(self.install_parents(), manual, self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            parent = dialog.destination.currentData()
+            manual_tool = parent == manual
+            settings = self.settings if manual_tool else self.local_scan_settings(parent)
+            folder = create_blank(parent, dialog.title.text(), dialog.description.toPlainText(), manual=manual_tool)
+            if not manual_tool:
+                self.record_local_mod(folder, settings)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+            self.statusBar().showMessage(f"已创建「{folder.name}」。", 5000)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.error("无法新建空模组", str(exc))
+        finally:
+            dialog.deleteLater()
+
+    def convert_workshop_mod(self):
+        parents = self.install_parents()
+        if not parents:
+            QMessageBox.information(self, "请选择游戏安装", "在「工具 → 扫描路径」设置游戏目录，再转换工坊 Mod。")
+            return
+        candidates = {mod.key: mod for mod in self.mods if mod.source == Source.WORKSHOP and mod.workshop_id}
+        if not candidates:
+            self.statusBar().showMessage("扫描后可以选择要复制的工坊 Mod。", 5000)
+            return
+        mod = self._detail_mod
+        if not mod or mod.key not in candidates:
+            records = [self.search_record(ModLocation("workshop", item.key), item, None, "工坊")
+                       for item in candidates.values()]
+            picker = GlobalSearchDialog(records, self, pick_mod=True)
+            picker.setWindowTitle("选择要转为本地的工坊 Mod")
+            if picker.exec() != QDialog.DialogCode.Accepted or not picker.target:
+                picker.deleteLater()
+                return
+            mod = candidates[picker.target.identity]
+            picker.deleteLater()
+        identity = next((row.entry.id for row in self.resolved if row.mod == mod), None)
+        dialog = WorkshopCopyDialog(mod, parents, bool(identity), self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            parent = dialog.destination.currentData()
+            settings = self.local_scan_settings(parent)
+            folder = run_operation(self, "正在复制并校验工坊文件…", lambda: copy_workshop_to_local(mod, parent),
+                                   title="工坊 Mod 转为本地")
+            local = self.record_local_mod(folder, settings)
+            notice = f"已将「{mod.name}」复制到本地。"
+            if identity and dialog.replace_plan.isChecked():
+                try:
+                    added = self.replace_plan_mod(identity, local, "切换到本地副本")
+                    notice += " 当前计划已切换到本地副本。"
+                    if added:
+                        notice += self.requirement_notice(added)
+                except ValueError as exc:
+                    notice += f" 当前计划需手动匹配。{exc}"
+            self.statusBar().showMessage(notice, 7500)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.error("无法完成工坊转本地", str(exc))
+        finally:
+            dialog.deleteLater()
+
+    def record_local_mod(self, folder, settings):
+        if settings is not self.settings:
+            settings.save(self.data_dir)
+            self.settings = settings
+        mod = parse_mod(folder, Source.LOCAL)
+        self.mods = [*self.mods, mod]
+        self.refresh_classifications()
+        self.refresh_tag_options()
+        self.render_lists()
+        self.request_rescan()
+        return mod
+
+    def uninstall_local_mod(self, mod):
+        roots = (self.discovery or discover(self.settings)).roots
+        try:
+            folder = local_installation(mod, roots)
+            original = folder.stat()
+            check_removal(self.profile, {row.entry.id for row in self.resolved if row.mod == mod})
+        except (OSError, ValueError) as exc:
+            self.error("无法卸载本地 Mod", str(exc))
+            return
+        profiles = [self.profile, *(profile for profile in self.store.list()[0] if profile.id != self.profile.id)]
+        names = [
+            profile.name for profile in profiles if any(
+                entry.reference == mod.reference
+                for entry in (*profile.entries, *(member for group in profile.mod_groups for member in group.members))
+            )
+        ]
+        detail = f"将「{mod.name}」移到 Windows 回收站。\n\n{folder}"
+        if names:
+            detail += "\n\n以下方案引用了这个 Mod，条目将等待重新匹配。\n" + "\n".join(names)
+        if not confirmation_dialog(self, "卸载本地 Mod", detail, "移到回收站"):
+            return
+        try:
+            require_game_stopped()
+            if original.st_ino != local_installation(mod, roots).stat().st_ino:
+                raise ValueError("目录已变化，请重新扫描后再操作。")
+            file = QFile(str(folder))
+            if not file.moveToTrash():
+                raise OSError(file.errorString())
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            self.error("无法移到回收站", str(exc))
+            return
+        self.mods = [item for item in self.mods if item.key != mod.key]
+        self.refresh_classifications()
+        self.refresh_tag_options()
+        self.render_lists()
+        self.request_rescan()
+        self.statusBar().showMessage(f"已将「{mod.name}」移到回收站。", 5000)
+
+    def open_file_replacements(self, *, mod=None):
+        dialog = FilePackDialog(self, mod=mod)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def refresh_file_packs(self, updated=None):
+        packs, _ = self.file_packs.list()
+        self.file_tool_keys = {pack.origin.key for pack in packs if pack.origin}
+        if updated is None or not self.edit_profile("转入游戏文件替换", updated):
+            self.render_lists()
+
+    def plan_for_file_import(self, origin: ModOrigin) -> tuple[Profile | None, str]:
+        def matches(row):
+            return row.mod.key == origin.key if row.mod else row.entry.reference == origin.reference
+
+        removed = {row.entry.id for row in self.resolved if matches(row)}
+        check_removal(self.profile, removed)
+        profiles, _ = self.store.list()
+        other_names = [
+            profile.name for profile in profiles if profile.id != self.profile.id
+            and any(matches(row) for row in resolve_entries(profile.entries, self.mods))
+        ]
+        notes = []
+        updated = None
+        if removed:
+            entries = self.profile.entries
+            kept_groups = []
+            for start, (group, end) in self.groups_by_index().items():
+                anchor = next((entry.id for entry in entries[start:end] if entry.id not in removed), None)
+                if anchor:
+                    kept_groups.append(replace(group, anchor=anchor))
+            kept_locks = [lock for lock in self.profile.locks if removed.isdisjoint(lock.members)]
+            updated = replace(
+                self.profile, entries=[entry for entry in entries if entry.id not in removed],
+                groups=kept_groups, locks=kept_locks,
+            )
+            notes.append(f"导入后将从当前方案草稿移出 {len(removed)} 项。可撤销这次方案编辑。")
+            if len(kept_locks) != len(self.profile.locks):
+                notes.append("涉及该 Mod 的联锁会解除，其余条目保留原顺序。")
+        if other_names:
+            notes.append("另有方案引用此 Mod。启用资源包后请避免重复加载。\n" + "、".join(other_names))
+        return updated, "\n".join(notes)
+
+    def exclude_scan_mod(self, mod: Mod):
+        if any(row.mod and row.mod.key == mod.key for row in self.resolved) and not confirmation_dialog(
+            self, "从扫描中排除",
+            f"「{mod.name}」在当前计划中。排除后，它会显示为待定位。\n"
+            "可在「工具 → 扫描路径」取消排除。",
+            "从扫描中排除",
+        ):
+            return
+        try:
+            path = Path(mod.path).resolve()
+            excluded = self.settings.excluded_paths.copy()
+            if path not in map(Path, excluded):
+                excluded.append(str(path))
+            settings = replace(self.settings, excluded_paths=excluded)
+            settings.save(self.data_dir)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.error("无法排除扫描目录", str(exc))
+            return
+        self.settings = settings
+        self.request_rescan()
+
+    def request_rescan(self):
+        if self.worker is not None:
+            self._rescan_after_worker = True
+            self.worker.requestInterruption()
+        else:
+            self.start_scan()
 
     def start_scan(self, checked=False, *, refresh=False):
         if self.worker is not None:
@@ -2434,6 +2991,9 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
         if self._close_pending:
             QTimer.singleShot(0, self.close)
+        elif self._rescan_after_worker:
+            self._rescan_after_worker = False
+            QTimer.singleShot(0, self.start_scan)
 
     def show_issues(self):
         self.show_dock(self.dock.issues[0])
@@ -2476,6 +3036,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.settings.last_profile = self.profile.id
+        self.save_detail_note()
+        self.remember_pane_sizes()
         try:
             self.settings.save(self.data_dir)
         except OSError as exc:

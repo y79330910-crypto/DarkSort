@@ -169,8 +169,6 @@ def describe_change(before: Profile, after: Profile) -> str:
         lines.append(f"Mod 分组发生变化 · {len(before.mod_groups)} → {len(after.mod_groups)} 组")
     if before.rules != after.rules:
         lines.append("该方案的排序规则已变化")
-    if before.staged != after.staged:
-        lines.append(f"暂存篮发生变化 · {len(before.staged)} → {len(after.staged)} 项")
     if before.locks != after.locks:
         lines.append(f"联锁发生变化 · {len(before.locks)} → {len(after.locks)} 组")
     return "\n".join(lines) or "条目与顺序一致"

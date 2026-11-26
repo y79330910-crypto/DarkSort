@@ -287,7 +287,8 @@ class SaveDialog(QDialog):
         if self.state is None or not self.binding_allows_apply():
             return
         try:
-            desired = mods_for_slot(self.resolved, self.installed, self.game_roots)
+            rules = self.profile.rules if self.profile else ()
+            desired = mods_for_slot(self.resolved, self.installed, self.game_roots, rules=rules)
             plan = prepare_write(self.state, desired)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法准备方案", str(exc))
@@ -316,7 +317,7 @@ class SaveDialog(QDialog):
         lines.extend(["", "应用前会将原始存档备份到 DarkSort 数据目录。"])
         if confirmation_dialog(self, "核对档位与顺序", "\n".join(lines), "备份并应用"):
             try:
-                refreshed = mods_for_slot(self.resolved, self.installed, self.game_roots)
+                refreshed = mods_for_slot(self.resolved, self.installed, self.game_roots, rules=rules)
                 if refreshed != desired:
                     raise ValueError("Mod 标识已变动，请重新预览。")
             except (OSError, ValueError) as exc:

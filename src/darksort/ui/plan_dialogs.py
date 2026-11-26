@@ -235,8 +235,6 @@ class HistoryDialog(QDialog):
             notes.append("分组有变化")
         if self.profile.rules != snapshot.profile.rules:
             notes.append("排序规则有变化")
-        if self.profile.staged != snapshot.profile.staged:
-            notes.append(f"暂存篮 {len(self.profile.staged)} → {len(snapshot.profile.staged)} 项有变化")
         if self.profile.locks != snapshot.profile.locks:
             notes.append(f"联锁 {len(self.profile.locks)} → {len(snapshot.profile.locks)} 组有变化")
         notes.append("按相同 Mod 对齐。顺延条目的相对顺序一致。")
@@ -286,7 +284,8 @@ class HistoryDialog(QDialog):
 
 class RuleDialog(QDialog):
     def __init__(
-        self, rules: list[OrderRule], targets: dict[str, SearchRecord], parent=None, *, first="", second="",
+        self, rules: list[OrderRule], targets: dict[str, SearchRecord], parent=None,
+        *, first="", second="", prerequisite=False,
     ):
         super().__init__(parent)
         self.targets = targets
@@ -298,7 +297,8 @@ class RuleDialog(QDialog):
         self.selected: list[tuple[str, ...]] = [(), ()]
         self.target_buttons = []
         self.creating = bool(first)
-        self.setWindowTitle("添加排序规则" if self.creating else "方案排序规则")
+        self.setWindowTitle("设置前置 Mod" if prerequisite else
+                            "添加排序规则" if self.creating else "方案排序规则")
         layout = QVBoxLayout(self)
         subtitle = QLabel("「在上方」可以选择 Mod、分组、标签或标记颜色。「依赖」可以选择两个具体 Mod。")
         subtitle.setObjectName("muted")
@@ -323,6 +323,9 @@ class RuleDialog(QDialog):
         self.relation = QComboBox()
         self.relation.addItem("在上方", "above")
         self.relation.addItem("依赖", "requires")
+        if prerequisite:
+            self.relation.setCurrentIndex(self.relation.findData("requires"))
+            self.relation.setEnabled(False)
         self.swap = QPushButton("交换 A/B")
         self.swap.setAutoDefault(False)
         self.swap.clicked.connect(self.swap_targets)

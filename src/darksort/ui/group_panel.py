@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QToolButton,
-    QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -26,7 +25,8 @@ from PySide6.QtWidgets import (
 from darksort.models import ModGroup, ProfileEntry
 from darksort.search import ModLocation, search_text
 from darksort.settings import MARK_COLORS
-from darksort.ui.mod_list import ROLE, GroupDragHandle
+from darksort.ui.mod_list import ROLE, GroupDragHandle, GroupMemberTree
+from darksort.ui.mod_menu import MenuCommand
 from darksort.ui.theme import current_theme, icon, problem_color
 
 
@@ -34,7 +34,7 @@ from darksort.ui.theme import current_theme, icon, problem_color
 class GroupMemberRow:
     entry: ProfileEntry
     name: str
-    target: ModLocation | None
+    target: ModLocation
     status: str
     tags: tuple[str, ...] = ()
 
@@ -87,7 +87,7 @@ class GroupShelf(QWidget):
         self.empty = QLabel(objectName="muted")
         self.empty.setWordWrap(True)
         layout.addWidget(self.empty)
-        self.tree = QTreeWidget(objectName="groupShelf")
+        self.tree = GroupMemberTree()
         self.tree.setAccessibleName("Mod 分组")
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(8)
@@ -95,6 +95,9 @@ class GroupShelf(QWidget):
         self.tree.setExpandsOnDoubleClick(False)
         self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.member_moved.connect(window.move_group_member)
+        self.tree.drag_state_changed.connect(self.set_drag_active)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.member_menu)
         self.tree.itemClicked.connect(self.show_member)
@@ -113,6 +116,7 @@ class GroupShelf(QWidget):
             with QSignalBlocker(self.search):
                 self.search.clear()
         self.data = data
+        self.tree.profile_id = profile_id
         self.render()
 
     def expand_all(self, expanded):
@@ -221,7 +225,7 @@ class GroupShelf(QWidget):
         name.setToolTip(group.title)
         header.addWidget(name, 1)
         active = sum(bool(row.target and row.target.side == "profile") for row in rows)
-        ready = sum(bool(row.target and row.target.side in {"library", "staging"}) for row in rows)
+        ready = sum(row.target.side == "library" for row in rows)
         count = QLabel(f"{active}/{len(rows)}", objectName="smallCaps")
         count.setToolTip(f"{active} 项已加入计划，组内共有 {len(rows)} 项")
         header.addWidget(count)
@@ -239,6 +243,8 @@ class GroupShelf(QWidget):
         menu.addAction("整组移出计划", lambda: self.window.apply_mod_group(group.id, "library")).setEnabled(bool(active))
         menu.addSeparator()
         menu.addAction("编辑名称、颜色和组员顺序…", lambda: self.window.edit_mod_group(group.id))
+        if group.locked:
+            menu.addAction("取消整组联锁", lambda: self.window.save_mod_group(replace(group, locked=False)))
         menu.addAction("保存为分组模板…", lambda: self.window.export_group_template(group.id))
         menu.addAction("删除分组…", lambda: self.window.delete_mod_group(group.id))
         more.setMenu(menu)
@@ -250,31 +256,51 @@ class GroupShelf(QWidget):
     def add_member(item, number, row):
         child = QTreeWidgetItem(item, [f"{number:02d}  {row.name}"])
         child.setData(0, ROLE, row)
-        child.setToolTip(0, f"{row.name}\n{row.entry.name}\n{row.status}" if row.name != row.entry.name
-                         else f"{row.name}\n{row.status}")
+        title = f"{row.name}\n{row.entry.name}" if row.name != row.entry.name else row.name
+        child.setToolTip(0, f"{title}\n{row.status}\n按住拖动调整组内顺序")
+        child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
         theme = current_theme()
-        side = row.target.side if row.target else "missing"
-        color = {"profile": theme.accent, "staging": problem_color("warning", theme),
-                 "library": theme.dim}.get(side, problem_color("error", theme))
+        color = {"profile": theme.accent, "library": theme.dim}.get(row.target.side, problem_color("error", theme))
         child.setIcon(0, icon("dot", color, 13))
 
     def show_member(self, item, _column):
         row = item.data(0, ROLE)
-        if isinstance(row, GroupMemberRow) and row.target:
-            self.window.navigate(row.target)
+        if isinstance(row, GroupMemberRow):
+            self.window.navigate(row.target, focus=False)
 
     def member_menu(self, point):
         item = self.tree.itemAt(point)
         if not item or not item.parent():
             return
         row, identity = item.data(0, ROLE), item.parent().data(0, ROLE)
-        menu = QMenu(self)
-        menu.aboutToHide.connect(menu.deleteLater)
-        menu.addAction("在列表定位", lambda: self.window.navigate(row.target)).setEnabled(bool(row.target))
-        if row.target is None:
-            menu.addAction("手动匹配本机 Mod…", lambda: self.window.relink_group_member(identity, row.entry.reference))
-        menu.addAction("从此分组移出", lambda: self.window.remove_group_member(identity, row.entry.reference))
-        menu.popup(self.tree.viewport().mapToGlobal(point))
+        commands = {"remove_member": MenuCommand(lambda: self.window.remove_group_member(identity, row.entry.id))}
+        if row.target.side == "group":
+            commands["match_member"] = MenuCommand(lambda: self.window.relink_group_member(identity, row.entry.id))
+        else:
+            commands["locate"] = MenuCommand(lambda: self.window.navigate(row.target))
+        selected = [child.data(0, ROLE).target for child in self.tree.selectedItems()
+                    if child.parent() == item.parent()]
+        self.window.show_mod_context_menu(
+            self.tree, self.tree.viewport().mapToGlobal(point), "group", row.target, selected, extra=commands,
+        )
+
+    def reveal_member(self, group_id, member_id, *, focus):
+        for index in range(self.tree.topLevelItemCount()):
+            group = self.tree.topLevelItem(index)
+            if group.data(0, ROLE) != group_id:
+                continue
+            for child_index in range(group.childCount()):
+                child = group.child(child_index)
+                if child.data(0, ROLE).entry.id == member_id:
+                    group.setExpanded(True)
+                    self.tree.setCurrentItem(child)
+                    self.tree.scrollToItem(child)
+                    if focus:
+                        self.tree.setFocus()
+                    return
+        if self.search.text():
+            self.search.clear()
+            self.reveal_member(group_id, member_id, focus=focus)
 
 
 class ModGroupDialog(QDialog):
@@ -329,5 +355,6 @@ class ModGroupDialog(QDialog):
             self.members.takeItem(self.members.row(item))
 
     def result_group(self):
+        members = tuple(self.members.item(i).data(ROLE) for i in range(self.members.count()))
         return replace(self.group, title=self.title.text().strip(), color=self.colors.currentData(),
-                       members=tuple(self.members.item(i).data(ROLE) for i in range(self.members.count())))
+                       members=members, locked=self.group.locked and len(members) >= 2)

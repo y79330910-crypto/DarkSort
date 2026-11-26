@@ -241,6 +241,8 @@ QTreeWidget#groupShelf { background: $surface; border: none; outline: none; }
 QTreeWidget#groupShelf::item { min-height: 24px; border-bottom: 1px solid $border; }
 QTreeWidget#groupShelf::item:hover { background: $stripe; }
 QTreeWidget#groupShelf::item:selected { background: $selection; color: $text; }
+QTreeWidget#featureGuide { background: $surface; outline: none; }
+QTreeWidget#featureGuide::item { min-height: 24px; border-bottom: 1px solid $border; }
 QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser {
     background: $inset; color: $text; border: 1px solid $border; border-radius: 6px;
     padding: 3px 6px; selection-background-color: $selection;
@@ -280,6 +282,12 @@ QProgressBar { background: $inset; border: 0; min-height: 4px; max-height: 4px; 
 QProgressBar::chunk { background: $accent; }
 QSplitter::handle { background: $background; }
 QSplitter::handle:hover { background: $strong; }
+QSplitter#workbenchPanes::handle:horizontal {
+    background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0,
+        stop: 0 $background, stop: 0.42 $background, stop: 0.43 $border,
+        stop: 0.57 $border, stop: 0.58 $background, stop: 1 $background);
+}
+QSplitter#workbenchPanes::handle:horizontal:hover { background: $strong; }
 QTabWidget::pane { border: 1px solid $border; background: $surface; top: -1px; border-radius: 7px; }
 QTabBar::base { border: 0; background: $background; }
 QTabBar::tab { min-height: 17px; padding: 4px 12px; background: $background; color: $muted;
