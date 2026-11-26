@@ -175,6 +175,7 @@ class MainWindow(QMainWindow):
         self._baseline = copy.deepcopy(profile_dict(self.profile))
         self.undo_stack = QUndoStack(self)
         self.undo_stack.setUndoLimit(100)
+        self.rule_dialog: RuleDialog | None = None
         self.mods: list[Mod] = []
         self.classifications: dict[str, Classification] = {}
         self.resolved: list[ResolvedEntry] = []
@@ -319,6 +320,10 @@ class MainWindow(QMainWindow):
                 for identity, (row, title) in self.group_entries.items()
             ],
         }
+        if self.rule_dialog is not None:
+            self.rule_dialog.update_candidates(
+                self.rule_search_targets() if self.rule_dialog.profile_id == self.profile.id else None,
+            )
         if self._temporary_target and not self.location_exists(self._temporary_target):
             self._temporary_target = None
         self.matching_targets = {}
@@ -542,7 +547,7 @@ class MainWindow(QMainWindow):
             temporary = ModLocation("profile", entry.id) == self._temporary_target
             if mod:
                 self.add_mod_item(
-                    self.profile_list, mod, value=index, entry_id=entry.id,
+                    self.profile_list, mod, value=index, entry_id=entry.id, reference=entry.reference,
                     number=index + 1, selected=entry.id in selected, temporary=temporary,
                 )
             else:
@@ -550,6 +555,7 @@ class MainWindow(QMainWindow):
                 data = {
                     "name": name, "classification": "待定位", "source": entry.source.value,
                     "value": index, "entry_id": entry.id, "number": index + 1, "missing": True,
+                    "reference": entry.reference,
                     "lock": self.lock_by_entry.get(entry.id), "temporary": temporary,
                     "problem": self.problem_levels.get(entry.id),
                     "mark_color": self.settings.mod_colors.get(entry.reference),
@@ -563,7 +569,7 @@ class MainWindow(QMainWindow):
         return visible
 
     def add_mod_item(
-        self, widget, mod, *, value, entry_id=None, number=None, selected=False, temporary=False,
+        self, widget, mod, *, value, entry_id=None, reference=None, number=None, selected=False, temporary=False,
     ):
         classification = self.classifications[mod.key]
         name = self.display_name(mod.reference, mod.name)
@@ -578,6 +584,7 @@ class MainWindow(QMainWindow):
                 "classification": classification.label,
                 "value": value,
                 "entry_id": entry_id,
+                "reference": reference or mod.reference,
                 "number": number,
                 "source": mod.source.value,
                 "preview": mod.preview_path,
@@ -2074,26 +2081,54 @@ class MainWindow(QMainWindow):
         return targets
 
     def edit_rules(self, *, first="", second="", prerequisite=False):
-        targets = self.rule_search_targets()
+        if self.rule_dialog is not None:
+            dialog = self.rule_dialog
+            if first and dialog.profile_id == self.profile.id:
+                dialog.prefill(first, second, prerequisite)
+            dialog.raise_()
+            dialog.activateWindow()
+            return
         dialog = RuleDialog(
-            self.profile.rules, targets, self, first=first, second=second, prerequisite=prerequisite,
+            self.profile, self.rule_search_targets(), self,
+            first=first, second=second, prerequisite=prerequisite,
         )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            rules = dialog.result_rules()
-            old = required_edges(self.profile.rules)
-            changed = dict.fromkeys(rule.first for rule in rules if rule.kind == "requires" and rule.enabled
-                                    and rule.second not in old.get(rule.first, ()))
-            active = {entry.reference for entry in self.profile.entries}
-            try:
-                required_mods(rules, changed, {key: target.title for key, target in targets.items()})
-                added = self.apply_activation(
-                    "编辑排序规则", replace(self.profile, rules=rules),
-                    roots=tuple(reference for reference in changed if reference in active),
-                )
-                if added:
-                    self.statusBar().showMessage(self.requirement_notice(added), 5500)
-            except ValueError as exc:
-                self.statusBar().showMessage(str(exc), 7500)
+        self.rule_dialog = dialog
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.save_requested.connect(self.save_rule_dialog)
+        dialog.finished.connect(self.rule_dialog_closed)
+        dialog.show()
+
+    def rule_dialog_closed(self, _result):
+        self.rule_dialog = None
+
+    def save_rule_dialog(self):
+        dialog = self.rule_dialog
+        if dialog is None:
+            return
+        if dialog.profile_id != self.profile.id:
+            QMessageBox.information(dialog, "方案已切换", "请切回这个窗口对应的方案，再保留规则。")
+            return
+        if dialog.original_rules != tuple(self.profile.rules):
+            QMessageBox.information(dialog, "规则已变化", "主窗口中的规则已变化。请核对后重新打开规则窗口。")
+            return
+        if dialog.creating and not dialog.add_rule():
+            return
+        rules = dialog.result_rules()
+        old = required_edges(self.profile.rules)
+        changed = dict.fromkeys(rule.first for rule in rules if rule.kind == "requires" and rule.enabled
+                                and rule.second not in old.get(rule.first, ()))
+        active = {entry.reference for entry in self.profile.entries}
+        try:
+            required_mods(rules, changed, {key: target.title for key, target in dialog.targets.items()})
+            added = self.apply_activation(
+                "编辑排序规则", replace(self.profile, rules=rules),
+                roots=tuple(reference for reference in changed if reference in active),
+            )
+            if added:
+                self.statusBar().showMessage(self.requirement_notice(added), 5500)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 7500)
+        dialog.accept()
 
     def edit_conflict_rule(self, first_id, second_id):
         if first_id in self.plan_positions and second_id in self.plan_positions:
@@ -3049,5 +3084,7 @@ class MainWindow(QMainWindow):
         if self.assistant:
             self.assistant.job.stop()
             self.assistant.hide()
+        if self.rule_dialog is not None:
+            self.rule_dialog.reject()
         self.mod_text_batch.shutdown()
         event.accept()

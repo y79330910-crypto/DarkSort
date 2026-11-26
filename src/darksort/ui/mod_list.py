@@ -395,10 +395,11 @@ class GroupMemberTree(QTreeWidget):
         if not item or not item.parent():
             return
         group_id = item.parent().data(0, ROLE)
-        member_id = item.data(0, ROLE).entry.id
+        entry = item.data(0, ROLE).entry
+        member_id = entry.id
         self.dragged = (group_id, member_id)
         payload = {"side": "group-member", "profile_id": self.profile_id,
-                   "group_id": group_id, "member_id": member_id}
+                   "group_id": group_id, "member_id": member_id, "references": [entry.reference]}
         mime = QMimeData()
         mime.setData(MIME, json.dumps(payload).encode())
         drag = QDrag(self)
@@ -406,7 +407,7 @@ class GroupMemberTree(QTreeWidget):
         drag.setPixmap(self.viewport().grab(self.visualItemRect(item)))
         self.drag_state_changed.emit(True)
         try:
-            drag.exec(Qt.DropAction.MoveAction)
+            drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, Qt.DropAction.MoveAction)
         finally:
             self.dragged = None
             self.drop_line = None
@@ -522,15 +523,19 @@ class ModList(QListWidget):
         self.viewport().update()
 
     def startDrag(self, supported_actions):
-        items = sorted(self.selectedItems(), key=self.row)
-        if not items:
+        rows = [item.data(ROLE) for item in sorted(self.selectedItems(), key=self.row)]
+        if not rows:
             return
-        payload = {"side": self.side, "values": [item.data(ROLE)["value"] for item in items]}
+        payload = {
+            "side": self.side,
+            "values": [row["value"] for row in rows],
+            "references": [row["reference"] for row in rows if "reference" in row],
+        }
         mime = QMimeData()
         mime.setData(MIME, json.dumps(payload).encode())
         drag = QDrag(self)
         drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.MoveAction)
+        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, Qt.DropAction.MoveAction)
 
     def dragEnterEvent(self, event):
         if self.accepts_drag(event):

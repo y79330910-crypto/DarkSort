@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -31,7 +32,7 @@ from darksort.profiles import MAX_RULES, resolve_entries
 from darksort.rule_targets import dynamic_target
 from darksort.search import SearchRecord
 from darksort.sorting import OrderPreview
-from darksort.ui.mod_list import ROLE
+from darksort.ui.mod_list import MIME, ROLE, GroupMemberTree, ModList
 from darksort.ui.search import GlobalSearchDialog
 from darksort.ui.theme import current_theme
 from darksort.ui.workspace_dock import data_table, decision_rows, fill_table
@@ -283,26 +284,27 @@ class HistoryDialog(QDialog):
 
 
 class RuleDialog(QDialog):
+    save_requested = Signal()
+
     def __init__(
-        self, rules: list[OrderRule], targets: dict[str, SearchRecord], parent=None,
+        self, profile: Profile, targets: dict[str, SearchRecord], parent=None,
         *, first="", second="", prerequisite=False,
     ):
-        super().__init__(parent)
-        self.targets = targets
-        counts = Counter(record.title for record in targets.values())
-        self.names = {
-            key: f"{record.title} · {key}" if counts[record.title] > 1 else record.title
-            for key, record in targets.items()
-        }
+        super().__init__(parent, Qt.WindowType.Tool)
+        self.profile_id = profile.id
+        self.profile_name = profile.name
+        self.original_rules = tuple(profile.rules)
         self.selected: list[tuple[str, ...]] = [(), ()]
         self.target_buttons = []
+        self.drop_highlight = None
         self.creating = bool(first)
-        self.setWindowTitle("设置前置 Mod" if prerequisite else
-                            "添加排序规则" if self.creating else "方案排序规则")
         layout = QVBoxLayout(self)
         subtitle = QLabel("「在上方」可以选择 Mod、分组、标签或标记颜色。「依赖」可以选择两个具体 Mod。")
         subtitle.setObjectName("muted")
+        subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
+        self.drag_hint = QLabel(objectName="muted", wordWrap=True)
+        layout.addWidget(self.drag_hint)
         self.list = QListWidget(self)
         if self.creating:
             self.resize(690, 260)
@@ -310,8 +312,6 @@ class RuleDialog(QDialog):
         else:
             self.resize(750, 510)
             layout.addWidget(self.list)
-        for rule in rules:
-            self.add_row(rule)
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         for position, caption in enumerate(("目标 A", "目标 B")):
@@ -323,9 +323,6 @@ class RuleDialog(QDialog):
         self.relation = QComboBox()
         self.relation.addItem("在上方", "above")
         self.relation.addItem("依赖", "requires")
-        if prerequisite:
-            self.relation.setCurrentIndex(self.relation.findData("requires"))
-            self.relation.setEnabled(False)
         self.swap = QPushButton("交换 A/B")
         self.swap.setAutoDefault(False)
         self.swap.clicked.connect(self.swap_targets)
@@ -356,20 +353,112 @@ class RuleDialog(QDialog):
         else:
             buttons.addButton("保留规则", QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
-        buttons.accepted.connect(self.accept_new_rule if self.creating else self.accept)
+        buttons.accepted.connect(self.save_requested.emit)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        for widget in (self, self.list.viewport(), *self.target_buttons):
+            widget.setAcceptDrops(True)
+            widget.installEventFilter(self)
+        self.update_candidates(targets)
+        for rule in self.original_rules:
+            self.add_row(rule)
+        self.prefill(first, second, prerequisite)
+
+    def update_candidates(self, targets):
+        self.drag_enabled = targets is not None
+        self.drag_hint.setText(
+            "将 Mod 拖到目标 A 或 B。拖到规则列表会填入空着的一侧。"
+            if self.drag_enabled else "切回此窗口对应的方案后，可以继续拖入 Mod。"
+        )
+        if targets is None:
+            self.highlight_drop(None)
+            return
+        self.targets = targets
+        counts = Counter(record.title for record in targets.values())
+        self.names = {
+            key: f"{record.title} · {key}" if counts[record.title] > 1 else record.title
+            for key, record in targets.items()
+        }
+        for position, selected in enumerate(self.selected):
+            self.set_targets(position, selected)
+
+    def prefill(self, first, second, prerequisite):
+        title = "方案排序规则"
+        if self.creating:
+            title = "设置前置 Mod" if prerequisite else "添加排序规则"
+        self.setWindowTitle(f"{title} · {self.profile_name}")
+        self.relation.setCurrentIndex(self.relation.findData("requires" if prerequisite else "above"))
+        self.relation.setEnabled(not prerequisite or not self.creating)
         self.set_targets(0, (first,))
         self.set_targets(1, (second,))
         if not second:
             self.target_buttons[1 if first else 0].setFocus()
+
+    def eventFilter(self, widget, event):
+        kind = event.type()
+        if kind == QEvent.Type.DragLeave:
+            self.highlight_drop(None)
+        if kind not in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
+            return super().eventFilter(widget, event)
+        point = event.position().toPoint()
+        if widget is not self:
+            point = widget.mapTo(self, point)
+        position = next(
+            (i for i, button in enumerate(self.target_buttons) if button.geometry().contains(point)), None,
+        )
+        if position is None:
+            position = next((i for i, selected in enumerate(self.selected) if not selected), None)
+        references = self.dropped_references(event, position) if position is not None else ()
+        self.highlight_drop(position if references and kind != QEvent.Type.Drop else None)
+        if references:
+            if kind == QEvent.Type.Drop:
+                self.set_targets(position, references)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+        return True
+
+    def dropped_references(self, event, position):
+        source = event.source()
+        mime = event.mimeData()
+        if (
+            not self.drag_enabled or not isinstance(source, (ModList, GroupMemberTree))
+            or source.window() is not self.parentWidget() or not mime.hasFormat(MIME)
+            or not event.possibleActions() & Qt.DropAction.CopyAction
+        ):
+            return ()
+        try:
+            payload = json.loads(bytes(mime.data(MIME)))
+        except ValueError:
+            return ()
+        references = payload.get("references") if isinstance(payload, dict) else None
+        if not isinstance(references, list):
+            return ()
+        other = set(self.selected[1 - position])
+        return tuple(dict.fromkeys(
+            ref for ref in references
+            if isinstance(ref, str) and ref in self.targets and ref not in other and not dynamic_target(ref)
+        ))
+
+    def highlight_drop(self, position):
+        if position == self.drop_highlight:
+            return
+        for index in (self.drop_highlight, position):
+            if index is not None:
+                button = self.target_buttons[index]
+                button.setProperty("ruleDropTarget", index == position)
+                button.style().unpolish(button)
+                button.style().polish(button)
+                button.update()
+        self.drop_highlight = position
 
     def set_targets(self, position, references):
         button = self.target_buttons[position]
         selected = tuple(reference for reference in references if reference in self.targets)
         self.selected[position] = selected
         if not selected:
-            button.setText("搜索并选择…")
+            button.setText("拖入 Mod 或搜索…")
             button.setToolTip("")
         elif len(selected) == 1:
             reference = selected[0]
@@ -448,10 +537,6 @@ class RuleDialog(QDialog):
                     self.add_row(OrderRule(source, target, kind, note))
         self.note.clear()
         return True
-
-    def accept_new_rule(self):
-        if self.add_rule():
-            self.accept()
 
     def remove_rule(self):
         for item in self.list.selectedItems():

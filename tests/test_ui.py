@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QContextMenuEvent
+from PySide6.QtGui import QContextMenuEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -724,21 +724,17 @@ def test_plan_context_adds_rule_using_exact_target_search(qtbot, tmp_path, mods,
         dialog.choose(dialog.results.item(0))
         return dialog.result()
 
-    def add(dialog):
-        assert dialog.selected == [(first.reference,), ()]
-        dialog.show()
-        target_button = dialog.target_buttons[1]
-        assert target_button.isVisible() and target_button.width() >= 160
-        qtbot.mouseClick(target_button, Qt.MouseButton.LeftButton)
-        assert dialog.selected == [(first.reference,), (second.reference,)]
-        dialog.accept_new_rule()
-        return dialog.result()
-
     monkeypatch.setattr("darksort.ui.search.GlobalSearchDialog.exec", choose)
-    monkeypatch.setattr("darksort.ui.plan_dialogs.RuleDialog.exec", add)
     menu = open_mod_context(qtbot, window.profile_list, 0)
     menu_action(menu, "添加排序规则…").trigger()
     menu.hide()
+    dialog = window.rule_dialog
+    assert dialog.selected == [(first.reference,), ()]
+    target_button = dialog.target_buttons[1]
+    assert target_button.isVisible() and target_button.width() >= 160
+    qtbot.mouseClick(target_button, Qt.MouseButton.LeftButton)
+    assert dialog.selected == [(first.reference,), (second.reference,)]
+    dialog.add.click()
     assert window.profile.rules == [OrderRule(first.reference, second.reference)]
     window.undo_stack.undo()
     assert not window.profile.rules
@@ -779,20 +775,125 @@ def test_rule_targets_shift_click_individually_across_searches(qtbot, tmp_path, 
         dialog.jump.click()
         return dialog.result()
 
-    def add(dialog):
-        dialog.target_buttons[1].click()
-        assert dialog.selected == [(source.reference,), (first.reference, last.reference)]
-        assert "2 组" in dialog.add.text()
-        dialog.accept_new_rule()
-        return dialog.result()
-
     monkeypatch.setattr("darksort.ui.search.GlobalSearchDialog.exec", choose)
-    monkeypatch.setattr("darksort.ui.plan_dialogs.RuleDialog.exec", add)
     window.edit_rules(first=source.reference)
+    dialog = window.rule_dialog
+    dialog.target_buttons[1].click()
+    assert dialog.selected == [(source.reference,), (first.reference, last.reference)]
+    assert "2 组" in dialog.add.text()
+    dialog.add.click()
     assert window.profile.rules == [
         OrderRule(source.reference, first.reference),
         OrderRule(source.reference, last.reference),
     ]
+
+
+def test_rule_dialog_copies_mod_targets_by_drag_from_all_three_lists(qtbot, tmp_path, mods, monkeypatch):
+    planned, *available = mods
+    window = make_window(qtbot, tmp_path, mods)
+    window.add_keys([planned.key])
+    members = tuple(ProfileEntry.from_mod(mod) for mod in available)
+    window.save_mod_group(ModGroup("配套模组", "#75b9ea", members))
+    window.show_utility_page(window.utility.groups_page)
+    window.edit_rules()
+    dialog = window.rule_dialog
+    assert not dialog.isModal()
+    assert QApplication.activeModalWidget() is None
+    destination = dialog.list.viewport()
+    expected_drop = 0
+
+    class DragToRule:
+        def __init__(self, source):
+            self.source = source
+
+        def setMimeData(self, mime):
+            self.mime = mime
+
+        def setPixmap(self, _):
+            pass
+
+        def exec(self, actions, default_action):
+            assert default_action == Qt.DropAction.MoveAction
+            point = QPointF(destination.rect().center())
+            drag_args = (point, actions, self.mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            enter = QDragEnterEvent(*drag_args)
+            enter.source = lambda: self.source
+            QApplication.sendEvent(destination, enter)
+            assert enter.isAccepted() == (expected_drop is not None)
+            assert dialog.drop_highlight == expected_drop
+            if expected_drop is not None:
+                drop = QDropEvent(*drag_args)
+                drop.source = lambda: self.source
+                QApplication.sendEvent(destination, drop)
+                assert drop.isAccepted() and drop.dropAction() == Qt.DropAction.CopyAction
+                assert dialog.drop_highlight is None
+
+    monkeypatch.setattr("darksort.ui.mod_list.QDrag", DragToRule)
+    plan = window.profile_list
+    plan.item(0).setSelected(True)
+    plan.startDrag(Qt.DropAction.MoveAction)
+    assert dialog.selected == [(planned.reference,), ()]
+
+    expected_drop = 1
+    library = window.library_list
+    dragged_references = tuple(library.item(i).data(ROLE)["reference"] for i in range(library.count()))
+    library.selectAll()
+    library.startDrag(Qt.DropAction.MoveAction)
+    assert dialog.selected == [(planned.reference,), dragged_references]
+
+    destination = dialog.target_buttons[1]
+    expected_drop = None
+    plan.startDrag(Qt.DropAction.MoveAction)
+    assert dialog.selected[1] == dragged_references
+
+    expected_drop = 1
+    group_tree = window.utility.group_shelf.tree
+    member = group_tree.topLevelItem(0).child(0)
+    group_tree.setCurrentItem(member)
+    group_tree.startDrag(Qt.DropAction.MoveAction)
+    assert dialog.selected == [(planned.reference,), (members[0].reference,)]
+    assert window.profile.mod_groups[0].members == members
+    assert len(window.profile.entries) == 1 and library.count() == 2
+    assert not window.profile.rules
+
+    dialog.add.click()
+    dialog.save_requested.emit()
+    assert window.profile.rules == [OrderRule(planned.reference, members[0].reference)]
+    assert window.rule_dialog is None
+    window.undo_stack.undo()
+    assert not window.profile.rules
+
+
+def test_modeless_rule_dialog_preserves_changes_made_in_main_window(qtbot, tmp_path, mods, monkeypatch):
+    first, second, third = mods
+    window = make_window(qtbot, tmp_path, mods)
+    window.add_keys([first.key])
+    window.save_profile()
+    original = window.profile.id
+    other = window.store.new("另一个方案")
+    window.edit_rules(first=first.reference, second=second.reference, prerequisite=True)
+    dialog = window.rule_dialog
+    assert dialog.relation.currentData() == "requires" and not dialog.relation.isEnabled()
+    notices = []
+    monkeypatch.setattr(QMessageBox, "information", lambda _parent, title, _body: notices.append(title))
+
+    window.activate_profile(other)
+    dialog.add.click()
+    assert notices == ["方案已切换"] and not window.profile.rules
+    assert window.rule_dialog is dialog and not dialog.drag_enabled
+
+    window.activate_profile(window.store.load(original))
+    newer_rule = OrderRule(third.reference, first.reference)
+    window.edit_profile("编辑排序规则", replace(window.profile, rules=[newer_rule]))
+    dialog.add.click()
+    assert notices == ["方案已切换", "规则已变化"] and window.profile.rules == [newer_rule]
+    window.undo_stack.undo()
+
+    window.add_keys([third.key])
+    dialog.add.click()
+    assert window.profile.rules == [OrderRule(first.reference, second.reference, "requires")]
+    assert [row.mod.key for row in window.resolved] == [first.key, third.key, second.key]
+    assert window.rule_dialog is None
 
 
 def test_linked_mod_folder_and_metadata_actions_follow_clicked_row(qtbot, tmp_path, mods, monkeypatch):
@@ -1274,17 +1375,12 @@ def test_badges_explain_and_follow_current_dd1_priority(qtbot, tmp_path, mods, m
     assert "甲 Mod" in panel.message.text()
     assert panel.targets.item(1).text().startswith("被覆盖")
     assert not panel.rule.isHidden()
-    prefilled = []
-
-    def read_rule(dialog):
-        prefilled.append(tuple(selection[0] for selection in dialog.selected))
-        dialog.swap.click()
-        assert dialog.selected == [(mods[1].reference,), (mods[0].reference,)]
-        return QDialog.DialogCode.Rejected
-
-    monkeypatch.setattr("darksort.ui.plan_dialogs.RuleDialog.exec", read_rule)
     panel.rule.click()
-    assert prefilled == [(mods[0].reference, mods[1].reference)]
+    dialog = window.rule_dialog
+    assert dialog.selected == [(mods[0].reference,), (mods[1].reference,)]
+    dialog.swap.click()
+    assert dialog.selected == [(mods[1].reference,), (mods[0].reference,)]
+    dialog.reject()
     assert len(window.profile.rules) == 1
     assert panel.technical.isHidden()
     panel.files.click()
@@ -1429,7 +1525,7 @@ def test_group_member_menu_and_drag_inside_group_and_into_plan(qtbot, tmp_path, 
         def setPixmap(self, _):
             pass
 
-        def exec(self, _):
+        def exec(self, _actions, _default_action):
             position = (tree.visualItemRect(tree.topLevelItem(0).child(2)).bottomLeft()
                         if destination is tree else QPoint(5, 5))
             destination.dropEvent(SimpleNamespace(

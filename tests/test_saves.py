@@ -7,7 +7,7 @@ import pytest
 
 from darksort.adapters import saves
 from darksort.adapters.dson import UGCS, DsonDocument, DsonField, SavedMod
-from darksort.models import ProfileEntry, Source
+from darksort.models import OrderRule, ProfileEntry, ProfileLock, Source
 from darksort.profiles import resolve_entries
 from darksort.scanning.metadata import parse_mod
 
@@ -131,7 +131,10 @@ def test_partial_replace_restores_missing_target_and_retains_backup(tmp_path, mo
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows save dialog and transaction")
-def test_save_dialog_applies_preview_to_selected_copy_and_records_history(qtbot, tmp_path, monkeypatch):
+@pytest.mark.parametrize("constraint", ["none", "requires", "lock"])
+def test_save_dialog_applies_preview_to_selected_copy_and_records_history(
+    qtbot, tmp_path, monkeypatch, constraint,
+):
     from darksort.history import ProfileHistory
     from darksort.profiles import ProfileStore
     from darksort.ui import save_dialog
@@ -144,20 +147,33 @@ def test_save_dialog_applies_preview_to_selected_copy_and_records_history(qtbot,
     folder = game / "mods" / "content"
     folder.mkdir(parents=True)
     (folder / "project.xml").write_text("<project><Title>本地标题</Title></project>", encoding="utf-8")
-    mod = parse_mod(folder, Source.LOCAL)
+    workshop_folder = tmp_path / "workshop" / WORKSHOP.name
+    workshop_folder.mkdir(parents=True)
+    (workshop_folder / "project.xml").write_text(
+        "<project><Title>工坊测试</Title></project>", encoding="utf-8",
+    )
+    installed = [parse_mod(folder, Source.LOCAL), parse_mod(workshop_folder, Source.WORKSHOP)]
+    entries = [ProfileEntry.from_mod(mod) for mod in installed]
     data_dir = tmp_path / "data"
-    profile = ProfileStore(data_dir).new("应用测试", [ProfileEntry.from_mod(mod)])
-    target = make_target(tmp_path, make_save())
-    resolved = resolve_entries(profile.entries, [mod])
-    dialog = save_dialog.SaveDialog(data_dir, [], [game], [mod], resolved, profile=profile)
+    profile = ProfileStore(data_dir).new("应用测试", entries)
+    if constraint == "requires":
+        profile.rules.append(OrderRule(entries[0].reference, entries[1].reference, kind="requires"))
+    elif constraint == "lock":
+        profile.locks.append(ProfileLock("测试联锁", tuple(entry.id for entry in entries)))
+    original = make_save()
+    target = make_target(tmp_path, original)
+    resolved = resolve_entries(profile.entries, installed)
+    dialog = save_dialog.SaveDialog(data_dir, [], [game], installed, resolved, profile=profile)
     qtbot.addWidget(dialog)
     dialog.slots.addItem("隔离档位", str(target))
     dialog.slots.setCurrentIndex(1)
     assert dialog.apply_button.isEnabled()
     assert "28385" in dialog.status.text()
     dialog.apply_button.click()
-    assert saves.read_slot(target).mods == (LOCAL,)
-    assert len(dialog.backups.list(target)[0]) == 1
+    assert saves.read_slot(target).mods == (LOCAL, WORKSHOP)
+    backups, errors = dialog.backups.list(target)
+    assert not errors and len(backups) == 1
+    assert (backups[0].directory / target.name).read_bytes() == original
     snapshots, errors = ProfileHistory(data_dir).list(profile.id)
     assert not errors and snapshots[0].profile.entries == profile.entries
 

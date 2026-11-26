@@ -286,9 +286,11 @@ class SaveDialog(QDialog):
     def apply_order(self):
         if self.state is None or not self.binding_allows_apply():
             return
+        profile_rules = self.profile.rules if self.profile is not None else ()
         try:
-            rules = self.profile.rules if self.profile else ()
-            desired = mods_for_slot(self.resolved, self.installed, self.game_roots, rules=rules)
+            desired = mods_for_slot(
+                self.resolved, self.installed, self.game_roots, rules=profile_rules,
+            )
             plan = prepare_write(self.state, desired)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法准备方案", str(exc))
@@ -307,17 +309,19 @@ class SaveDialog(QDialog):
         for mod, entry in zip(self.state.mods, current_entries, strict=True):
             if mod.key not in selected_keys:
                 lines.append(f"移除  {entry.name}")
-        if self.profile is not None and (self.profile.rules or self.profile.locks):
-            rules = preview_order(self.profile, self.resolved, **self.rule_marks)
-            notices = [*rules.blockers, *rules.notices]
-            if rules.entries != tuple(self.profile.entries):
+        if self.profile is not None and (profile_rules or self.profile.locks):
+            rule_preview = preview_order(self.profile, self.resolved, **self.rule_marks)
+            notices = [*rule_preview.blockers, *rule_preview.notices]
+            if rule_preview.entries != tuple(self.profile.entries):
                 notices.append("当前计划与规则建议的顺序不同。")
             if notices:
                 lines.extend(["", "方案规则提示", *notices])
         lines.extend(["", "应用前会将原始存档备份到 DarkSort 数据目录。"])
         if confirmation_dialog(self, "核对档位与顺序", "\n".join(lines), "备份并应用"):
             try:
-                refreshed = mods_for_slot(self.resolved, self.installed, self.game_roots, rules=rules)
+                refreshed = mods_for_slot(
+                    self.resolved, self.installed, self.game_roots, rules=profile_rules,
+                )
                 if refreshed != desired:
                     raise ValueError("Mod 标识已变动，请重新预览。")
             except (OSError, ValueError) as exc:

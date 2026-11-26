@@ -185,6 +185,7 @@ QPushButton, QToolButton {
     padding: 4px 9px; min-height: 17px;
 }
 QPushButton:hover, QToolButton:hover { background: $stripe; border-color: $accent; }
+QPushButton[ruleDropTarget="true"] { background: $accent_tint; border-color: $accent; }
 QPushButton:pressed, QToolButton:pressed { background: $inset; }
 QPushButton:disabled, QToolButton:disabled { color: $dim; background: $inset; border-color: $border; }
 QPushButton#primary { background: $accent; color: $on_accent; border-color: $accent; font-weight: 650; }
